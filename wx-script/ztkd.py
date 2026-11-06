@@ -30,16 +30,181 @@ import os
 import sys
 import logging
 import traceback
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def _yyb_auth_headers():
     """YYB-Go-Enhanced 协议接口鉴权头；未配置令牌时返回空字典，兼容未开启鉴权的服务端。"""
     _token = (os.getenv("YYB_API_KEY") or os.getenv("YYB_PROTOCOL_TOKEN") or "").strip()
-    return {"Authorization": "Bearer " + _token} if _token else {}
+    headers = {}
+    if _token:
+        headers["Authorization"] = "Bearer " + _token
+    headers.setdefault("Content-Type", "application/json")
+    return headers
 
 MULTI_ACCOUNT_PROXY = False # 是否使用多账号代理，默认不使用，True则使用多账号代理
 NOTIFY = os.getenv("LY_NOTIFY") or False # 是否推送日志，默认不推送，True则推送
+
+# ============ YYB 相关（CodeProvider 模式） ============
+# 服务地址优先级：WECHAT_SERVER 环境变量 > YYB_SERVER（地址@ref 行，兼容旧配置）
+WECHAT_SERVER = os.getenv("WECHAT_SERVER", "").strip()
+SERVERS = [s.strip() for s in WECHAT_SERVER.split(",") if s.strip()]
+
+YYB_REFS: List[str] = []  # 空=自动从 /accounts 获取，非空=只用这里指定的 ref
+
+CODE_RETRY_TIMES = 3      # 获取 code 最大重试次数
+RETRY_BASE_DELAY = 3      # 指数退避基数（秒）
+REQUEST_TIMEOUT = 30      # 请求超时（秒）
+
+
+def normalize_server(server: str) -> str:
+    """标准化服务地址：去末尾斜杠，补 http:// 前缀"""
+    server = str(server or "").strip().rstrip("/")
+    if not server.startswith("http://") and not server.startswith("https://"):
+        server = "http://" + server
+    return server
+
+
+def json_or_text(response: requests.Response) -> Any:
+    try:
+        return response.json()
+    except Exception:
+        return response.text[:300]
+
+
+def extract_code(data: Any) -> str:
+    """从 YYB 服务多层响应结构中提取 code"""
+    if not isinstance(data, dict):
+        return ""
+    direct = data.get("code") or data.get("wx_code")
+    if direct not in (None, "", 0):
+        return str(direct)
+    nested = data.get("Data") or data.get("data") or {}
+    if isinstance(nested, dict):
+        nested_code = nested.get("code") or nested.get("wx_code")
+        if nested_code not in (None, "", 0):
+            return str(nested_code)
+        result = nested.get("result") or {}
+        if isinstance(result, dict):
+            result_code = result.get("code") or result.get("wx_code")
+            if result_code not in (None, "", 0):
+                return str(result_code)
+    return ""
+
+
+def extract_accounts_payload(data: Any) -> List[Any]:
+    """从 YYB /accounts 响应中提取账号列表（支持多层嵌套）"""
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    for key in ("accounts", "data", "list", "rows", "result"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            nested = extract_accounts_payload(value)
+            if nested:
+                return nested
+    return []
+
+
+def extract_ref(item: Any) -> str:
+    """从账号项中提取 ref 字段"""
+    if isinstance(item, str):
+        return item.strip()
+    if not isinstance(item, dict):
+        return ""
+    for key in ("ref", "openid", "openId", "wxid", "wx_id", "id", "account"):
+        value = item.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+
+def extract_label(item: Any, fallback: str) -> str:
+    """从账号项中提取显示名（remark > name > nickname > ... > fallback）"""
+    if not isinstance(item, dict):
+        return fallback
+    for key in ("remark", "name", "nickname", "nickName", "label", "wxid", "openid", "ref"):
+        value = item.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return fallback
+
+
+@dataclass
+class CodeAccount:
+    label: str   # 显示名称
+    ref: str     # 账号标识，提交给 /wxapp/getCode
+
+
+class YybCodeProvider:
+    """与 YYB 服务交互：/accounts 发现账号 + /wxapp/getCode 取码。"""
+
+    def __init__(self, server: str, appid: str):
+        self.server = normalize_server(server)
+        self.appid = appid
+        self.session = requests.Session()
+        self.session.verify = False
+
+    def list_accounts(self) -> List[CodeAccount]:
+        # 优先用手动配置的 YYB_REFS
+        refs = [str(x).strip() for x in YYB_REFS if str(x).strip()]
+        if refs:
+            return [CodeAccount(label=x, ref=x) for x in refs]
+
+        # 自动从 /accounts 获取
+        if not self.server:
+            return []
+
+        url = f"{self.server}/accounts"
+        try:
+            response = self.session.get(url, timeout=REQUEST_TIMEOUT)
+            data = json_or_text(response)
+            items = extract_accounts_payload(data)
+        except Exception:
+            return []
+
+        accounts: List[CodeAccount] = []
+        seen = set()
+        for item in items:
+            ref = extract_ref(item)
+            if not ref or ref in seen:
+                continue
+            seen.add(ref)
+            accounts.append(CodeAccount(label=extract_label(item, ref), ref=ref))
+        return accounts
+
+    def get_code(self, account: CodeAccount) -> Optional[str]:
+        """POST /wxapp/getCode 获取微信 code，指数退避重试"""
+        if not self.server:
+            return None
+
+        url = f"{self.server}/wxapp/getCode"
+        payload = {"app_id": self.appid, "ref": account.ref}
+        headers = dict(_yyb_auth_headers())
+        headers.setdefault("User-Agent", "Mozilla/5.0 MicroMessenger/8.0.50")
+
+        for attempt in range(1, CODE_RETRY_TIMES + 1):
+            try:
+                response = self.session.post(
+                    url, json=payload, headers=headers, timeout=REQUEST_TIMEOUT
+                )
+                data = json_or_text(response)
+                code = extract_code(data)
+                if code:
+                    return code
+            except Exception:
+                pass
+
+            if attempt < CODE_RETRY_TIMES:
+                time.sleep(RETRY_BASE_DELAY * attempt)
+
+        return None
+# =================================================
 
 class AutoTask:
     def __init__(self, site_name):
@@ -60,22 +225,11 @@ class AutoTask:
         print(formatted)
         self.log_msgs.append(formatted)
 
-    def get_wx_code(self, server, ref):
+    def get_wx_code(self, provider: "YybCodeProvider", account: "CodeAccount") -> Optional[str]:
         try:
-            host = server.rstrip("/")
-            if not host.startswith(("http://", "https://")):
-                host = f"http://{host}"
-            response = requests.post(
-                f"{host}/wxapp/getCode",
-                headers=_yyb_auth_headers(),
-                json={"ref": ref, "app_id": self.wx_appid},
-                timeout=20,
-            )
-            response.raise_for_status()
-            body = response.json()
-            code = ((body.get("data") or {}).get("result") or {}).get("code")
-            if body.get("code") != 0 or not code:
-                self.log(f"[获取 code]失败，YYB-Go 响应码: {body.get('code')}", level="error")
+            code = provider.get_code(account)
+            if not code:
+                self.log("[获取 code]失败，重试后仍未取得", level="error")
                 return None
             self.log("[获取 code]成功")
             return code
@@ -120,10 +274,7 @@ class AutoTask:
 
 
     def check_env(self):
-        """
-        检查环境变量
-        :return: 环境变量字符串
-        """
+        """解析旧版 YYB_SERVER（每行 地址@ref），返回 [(server, ref), ...]；兼容保留。"""
         try:
             yyb_server = os.getenv("YYB_SERVER", "")
             if not yyb_server.strip():
@@ -296,8 +447,21 @@ class AutoTask:
 
             self.log(f"【{self.site_name}】开始执行任务")
 
-            # 检查环境变量
-            for index, (server, ref) in enumerate(self.check_env(), 1):
+            # Step 1: 先收集账号（WECHAT_SERVER /accounts 优先，YYB_SERVER 地址@ref 行兼容回退）
+            all_accounts: List[Tuple[CodeAccount, YybCodeProvider]] = []
+            for server in SERVERS:
+                provider = YybCodeProvider(server, self.wx_appid)
+                for account in provider.list_accounts():
+                    all_accounts.append((account, provider))
+            if not all_accounts:
+                providers: Dict[str, YybCodeProvider] = {}
+                for server, ref in self.check_env():
+                    normalized = normalize_server(server)
+                    provider = providers.setdefault(normalized, YybCodeProvider(normalized, self.wx_appid))
+                    all_accounts.append((CodeAccount(label=ref, ref=ref), provider))
+
+            # Step 2: 执行任务
+            for index, (account, provider) in enumerate(all_accounts, 1):
                 self.log("")
                 self.log(f"------ 【账号{index}】开始执行任务 ------")
 
@@ -325,7 +489,7 @@ class AutoTask:
                 })
 
                 # 执行微信授权
-                code = self.get_wx_code(server, ref)
+                code = self.get_wx_code(provider, account)
                 if not code:
                     self.account_results.append({
                         "index": index,
