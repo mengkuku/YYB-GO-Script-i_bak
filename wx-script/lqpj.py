@@ -30,8 +30,10 @@ import json
 import os
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -232,6 +234,173 @@ SIGNED = "sign"                                       # taskSignDtoList[].signSt
 # 账号列表：自动从 yyb_go 同步存活账号（可用 lqpj / WX_ID 指定白名单）
 ACCOUNT_REFS = yyb.resolve_accounts("lqpj")
 
+# ============ YYB 相关（CodeProvider 模式） ============
+# 服务地址优先级：WECHAT_SERVER 环境变量 > YYB_SERVER（地址@ref 行，兼容旧配置）
+WECHAT_SERVER = os.getenv("WECHAT_SERVER", "").strip()
+SERVERS = [s.strip() for s in WECHAT_SERVER.split(",") if s.strip()]
+
+YYB_REFS: List[str] = []  # 空=自动从 /accounts 获取，非空=只用这里指定的 ref
+
+CODE_RETRY_TIMES = 3      # 获取 code 最大重试次数
+RETRY_BASE_DELAY = 3      # 指数退避基数（秒）
+REQUEST_TIMEOUT = 30      # 请求超时（秒）
+
+
+def normalize_server(server: str) -> str:
+    """标准化服务地址：去末尾斜杠，补 http:// 前缀"""
+    server = str(server or "").strip().rstrip("/")
+    if not server.startswith("http://") and not server.startswith("https://"):
+        server = "http://" + server
+    return server
+
+
+def json_or_text(response: requests.Response) -> Any:
+    try:
+        return response.json()
+    except Exception:
+        return response.text[:300]
+
+
+def extract_code(data: Any) -> str:
+    """从 YYB 服务多层响应结构中提取 code"""
+    if not isinstance(data, dict):
+        return ""
+    direct = data.get("code") or data.get("wx_code")
+    if direct not in (None, "", 0):
+        return str(direct)
+    nested = data.get("Data") or data.get("data") or {}
+    if isinstance(nested, dict):
+        nested_code = nested.get("code") or nested.get("wx_code")
+        if nested_code not in (None, "", 0):
+            return str(nested_code)
+        result = nested.get("result") or {}
+        if isinstance(result, dict):
+            result_code = result.get("code") or result.get("wx_code")
+            if result_code not in (None, "", 0):
+                return str(result_code)
+    return ""
+
+
+def extract_accounts_payload(data: Any) -> List[Any]:
+    """从 YYB /accounts 响应中提取账号列表（支持多层嵌套）"""
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    for key in ("accounts", "data", "list", "rows", "result"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            nested = extract_accounts_payload(value)
+            if nested:
+                return nested
+    return []
+
+
+def extract_ref(item: Any) -> str:
+    """从账号项中提取 ref 字段"""
+    if isinstance(item, str):
+        return item.strip()
+    if not isinstance(item, dict):
+        return ""
+    for key in ("ref", "openid", "openId", "wxid", "wx_id", "id", "account"):
+        value = item.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+
+def extract_label(item: Any, fallback: str) -> str:
+    """从账号项中提取显示名（remark > name > nickname > ... > fallback）"""
+    if not isinstance(item, dict):
+        return fallback
+    for key in ("remark", "name", "nickname", "nickName", "label", "wxid", "openid", "ref"):
+        value = item.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return fallback
+
+
+@dataclass
+class CodeAccount:
+    label: str   # 显示名称
+    ref: str     # 账号标识，提交给 /wxapp/getCode
+
+
+class YybCodeProvider:
+    def __init__(self, server: str):
+        self.server = normalize_server(server)
+        self.session = requests.Session()
+        self.session.verify = False
+
+    def list_accounts(self) -> List[CodeAccount]:
+        # 优先用手动配置的 YYB_REFS
+        refs = [str(x).strip() for x in YYB_REFS if str(x).strip()]
+        if refs:
+            return [CodeAccount(label=x, ref=x) for x in refs]
+
+        # 自动从 /accounts 获取
+        if not self.server:
+            print("未配置 YYB 服务地址，且 YYB_REFS 为空")
+            return []
+
+        url = f"{self.server}/accounts"
+        try:
+            response = self.session.get(url, timeout=REQUEST_TIMEOUT)
+            data = json_or_text(response)
+            items = extract_accounts_payload(data)
+        except Exception as exc:
+            print(f"读取 YYB /accounts 异常：{str(exc)[:120]}")
+            return []
+
+        accounts: List[CodeAccount] = []
+        seen = set()
+        for item in items:
+            ref = extract_ref(item)
+            if not ref or ref in seen:
+                continue
+            seen.add(ref)
+            accounts.append(CodeAccount(label=extract_label(item, ref), ref=ref))
+
+        print(f"YYB /accounts 解析到 {len(accounts)} 个账号")
+        return accounts
+
+    def get_code(self, account: CodeAccount) -> Optional[str]:
+        """POST /wxapp/getCode 获取微信 code，指数退避重试"""
+        if not self.server:
+            print("未配置 YYB 服务地址，无法请求 /wxapp/getCode")
+            return None
+
+        url = f"{self.server}/wxapp/getCode"
+        payload = {"app_id": MINI_APP_ID, "ref": account.ref}
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 MicroMessenger/8.0.50",
+        }
+        api_key = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
+        if api_key:
+            headers["Authorization"] = api_key if " " in api_key else "Bearer " + api_key
+
+        for attempt in range(1, CODE_RETRY_TIMES + 1):
+            try:
+                response = self.session.post(
+                    url, json=payload, headers=headers, timeout=REQUEST_TIMEOUT
+                )
+                data = json_or_text(response)
+                code = extract_code(data)
+                if code:
+                    return code
+                print(f"{account.label} 获取 code 为空 resp={str(data)[:160]}")
+            except Exception as exc:
+                print(f"{account.label} 获取 code 异常：{str(exc)[:120]}")
+
+            if attempt < CODE_RETRY_TIMES:
+                time.sleep(RETRY_BASE_DELAY * attempt)
+
+        return None
+# =================================================
+
 TOKEN_CACHE_PATH = Path(__file__).with_name("liquanpijiu_token_cache.json")
 DEFAULT_UA = (
     "Mozilla/5.0 (Linux; Android 13; SM-G9910 Build/TP1A.220624.014) "
@@ -312,6 +481,31 @@ def get_wx_code(openid):
 
 
 # ---------------------------------------------------------------------------
+# CodeProvider 路径：provider -> wx.login code
+# ---------------------------------------------------------------------------
+_PROVIDER_CONTEXT: Dict[str, Tuple[YybCodeProvider, CodeAccount]] = {}
+
+
+def provider_for(account: CodeAccount, provider: YybCodeProvider) -> None:
+    """注册账号到 provider 的映射，供 run_account 内部取码使用。"""
+    _PROVIDER_CONTEXT[account.ref] = (provider, account)
+
+
+def get_wx_code_provider(openid):
+    """优先走 YybCodeProvider 取码，失败回落旧适配器。"""
+    context = _PROVIDER_CONTEXT.get(str(openid).split("#")[0].strip())
+    if context:
+        provider, account = context
+        code = provider.get_code(account)
+        if code:
+            print("✅ [授权] code 获取成功")
+            return str(code)
+        print("❌ [授权] provider code 获取失败")
+        return None
+    return get_wx_code(openid)
+
+
+# ---------------------------------------------------------------------------
 # 漓泉会员 API
 # ---------------------------------------------------------------------------
 def api_headers(token=None):
@@ -371,7 +565,7 @@ def resp_msg(resp):
 # ---------------------------------------------------------------------------
 def login(openid):
     """wx.login code -> wxLogin -> (token, unionId)。code 放在 URL 路径中。"""
-    code = get_wx_code(openid)
+    code = get_wx_code_provider(openid)
     resp = api_get(f"/mbr/members/wxLogin/{code}", params={"appId": MINI_APP_ID})
     if resp_code(resp) != 0:
         raise RuntimeError(f"登录失败: {resp_msg(resp) or resp_code(resp)}")
@@ -516,22 +710,44 @@ def run_account(openid, index):
 
 
 def main():
-    entries = ACCOUNT_REFS
+    # Step 1: 先收集账号（WECHAT_SERVER /accounts 优先，YYB_SERVER 地址@ref 行兼容回退）
+    all_accounts: List[Tuple[CodeAccount, YybCodeProvider]] = []
+    for server in SERVERS:
+        provider = YybCodeProvider(server)
+        for account in provider.list_accounts():
+            all_accounts.append((account, provider))
+    if not all_accounts:
+        providers: Dict[str, YybCodeProvider] = {}
+        for entry in ACCOUNT_REFS:
+            parts = entry.split("#", 1)
+            openid = parts[0].strip()
+            if not openid:
+                continue
+            # 经 _yyb_routes 找到该 ref 对应的服务地址
+            try:
+                route = _yyb_route(openid)
+            except Exception:
+                route = None
+            server = normalize_server(route["server"]) if route else ""
+            if not server:
+                continue
+            provider = providers.setdefault(server, YybCodeProvider(server))
+            remark = parts[1].strip() if len(parts) > 1 else openid
+            all_accounts.append((CodeAccount(label=remark, ref=openid), provider))
 
-    if not entries:
+    if not all_accounts:
         print("❌ 未从 yyb_go 获取到存活账号(可配置环境变量 lqpj 指定白名单), 退出。")
         return
 
     print("=============== 漓泉啤酒 签到开始 ===============")
     summaries = []
     ok_count = 0
-    for i, entry in enumerate(entries, 1):
-        parts = entry.split("#", 1)
-        openid = parts[0].strip()
-        remark = parts[1].strip() if len(parts) > 1 else ""
-        print(f"\n-------------- 账号 {i}{('/' + remark) if remark else ''} --------------")
+    # Step 2: 执行任务
+    for i, (account, provider) in enumerate(all_accounts, 1):
+        print(f"\n-------------- 账号 {i}{('/' + account.label if account.label != account.ref else '')} --------------")
         try:
-            summary, ok = run_account(openid, i)
+            provider_for(account, provider)
+            summary, ok = run_account(account.ref, i)
             summaries.append(summary)
             ok_count += 1 if ok else 0
         except Exception as e:
@@ -540,7 +756,7 @@ def main():
         time.sleep(1)
 
     print("\n=============== 漓泉啤酒 签到结束 ===============")
-    title = f"漓泉啤酒签到 {ok_count}/{len(entries)} 成功"
+    title = f"漓泉啤酒签到 {ok_count}/{len(all_accounts)} 成功"
     try:
         send(title, "\n\n".join(summaries))
     except Exception as e:
