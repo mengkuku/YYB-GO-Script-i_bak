@@ -17,7 +17,8 @@
   8. 品赞代理，业务请求优先代理，失败直连兜底
 
 环境变量：
-  YYB_SERVER             必填：wxcode服务地址，多地址换行填写
+  WECHAT_SERVER          推荐：YYB 服务地址（逗号分隔多实例），自动从 /accounts 发现账号
+  YYB_SERVER             兼容旧格式：每行 地址@微信账号标识；未配置 WECHAT_SERVER 时使用
   PLUSPLUS_TOKEN    PushPlus token，可选
   PROXY_API         品赞代理提取 API，可选
   PROXY_TYPE        http / socks5，默认 http
@@ -34,8 +35,9 @@ import os
 import random
 import time
 import traceback
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import requests
@@ -44,23 +46,16 @@ import requests
 APP_NAME = "铛铛一下旧衣服回收小程序"
 APPID = "wxe378d2d7636c180e"
 
-# ========== 修改点：从环境变量 YYB_SERVER 读取服务地址，换行分割 ==========
-SERVERS = []
-env_YYB_SERVER = os.getenv("YYB_SERVER", "")
-if env_YYB_SERVER:
-    raw_lines = env_YYB_SERVER.splitlines()
-    # 去除每行首尾空格、过滤空行
-    SERVERS = [line.strip() for line in raw_lines if line.strip()]
+# ============ YYB 相关（CodeProvider 模式） ============
+# 服务地址优先级：WECHAT_SERVER 环境变量 > YYB_SERVER（地址@ref 行，兼容旧配置）
+WECHAT_SERVER = os.getenv("WECHAT_SERVER", "").strip()
+SERVERS = [s.strip() for s in WECHAT_SERVER.split(",") if s.strip()]
 
-# 无有效地址直接退出
-if len(SERVERS) == 0:
-    print("❌ 未配置环境变量 YYB_SERVER")
-    print("格式：yyb-go:8000@账号ID或OpenID，多账号换行分隔")
-    exit(1)
+YYB_REFS: List[str] = []  # 空=自动从 /accounts 获取，非空=只用这里指定的 ref
 
-print(f"✅ 读取到 {len(SERVERS)} 个 YYB Go 账号")
-print("-" * 60 + "\n")
-# =================================================================
+CODE_RETRY_TIMES = 3      # 获取 code 最大重试次数
+RETRY_BASE_DELAY = 3      # 指数退避基数（秒）
+# =================================================
 
 CHANNEL_ID = os.getenv("DD1X_CHANNEL_ID", "154")
 
@@ -123,27 +118,172 @@ def to_float(value: Any) -> float:
         return 0.0
 
 
-def log_title() -> None:
+def log_title(total_accounts: int = 0) -> None:
     print()
     print("╔" + "═" * 50 + "╗")
     print("║ ♻️ 铛铛一下旧衣服回收动态 code 版             ║")
     print(f"║ 🕒 启动时间: {now_text():<32}║")
-    print(f"║ 🔢 账号数量: {len(SERVERS):<34}║")
+    print(f"║ 🔢 账号数量: {total_accounts:<34}║")
     print("╚" + "═" * 50 + "╝")
-
-
-def log_account_header(index: int, total: int, server: str) -> None:
-    print()
-    print("┌" + "─" * 50 + "┐")
-    print(f"│ 🧩 账号 {index} / {total:<37}│")
-    print(f"│ 🌍 来源 {server:<40}│")
-    print("└" + "─" * 50 + "┘")
 
 
 def direct_session() -> requests.Session:
     session = requests.Session()
     session.trust_env = False
     return session
+
+
+def json_or_text(response: requests.Response) -> Any:
+    try:
+        return response.json()
+    except Exception:
+        return response.text[:300]
+
+
+def extract_code(data: Any) -> str:
+    """从 YYB 服务多层响应结构中提取 code"""
+    if not isinstance(data, dict):
+        return ""
+    direct = data.get("code") or data.get("wx_code")
+    if direct not in (None, "", 0):
+        return str(direct)
+    nested = data.get("Data") or data.get("data") or {}
+    if isinstance(nested, dict):
+        nested_code = nested.get("code") or nested.get("wx_code")
+        if nested_code not in (None, "", 0):
+            return str(nested_code)
+        result = nested.get("result") or {}
+        if isinstance(result, dict):
+            result_code = result.get("code") or result.get("wx_code")
+            if result_code not in (None, "", 0):
+                return str(result_code)
+    return ""
+
+
+def extract_accounts_payload(data: Any) -> List[Any]:
+    """从 YYB /accounts 响应中提取账号列表（支持多层嵌套）"""
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    for key in ("accounts", "data", "list", "rows", "result"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            nested = extract_accounts_payload(value)
+            if nested:
+                return nested
+    return []
+
+
+def extract_ref(item: Any) -> str:
+    """从账号项中提取 ref 字段"""
+    if isinstance(item, str):
+        return item.strip()
+    if not isinstance(item, dict):
+        return ""
+    for key in ("ref", "openid", "openId", "wxid", "wx_id", "id", "account"):
+        value = item.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+
+def extract_label(item: Any, fallback: str) -> str:
+    """从账号项中提取显示名（remark > name > nickname > ... > fallback）"""
+    if not isinstance(item, dict):
+        return fallback
+    for key in ("remark", "name", "nickname", "nickName", "label", "wxid", "openid", "ref"):
+        value = item.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return fallback
+
+
+def normalize_server(server: str) -> str:
+    """标准化服务地址：去末尾斜杠，补 http:// 前缀"""
+    server = str(server or "").strip().rstrip("/")
+    if not server.startswith("http://") and not server.startswith("https://"):
+        server = "http://" + server
+    return server
+
+
+@dataclass
+class CodeAccount:
+    label: str   # 显示名称
+    ref: str     # 账号标识，提交给 /wxapp/getCode
+
+
+class YybCodeProvider:
+    def __init__(self, server: str):
+        self.server = normalize_server(server)
+        self.session = requests.Session()
+        self.session.verify = False
+
+    def list_accounts(self) -> List[CodeAccount]:
+        # 优先用手动配置的 YYB_REFS
+        refs = [str(x).strip() for x in YYB_REFS if str(x).strip()]
+        if refs:
+            return [CodeAccount(label=x, ref=x) for x in refs]
+
+        # 自动从 /accounts 获取
+        if not self.server:
+            print("未配置 YYB 服务地址，且 YYB_REFS 为空")
+            return []
+
+        url = f"{self.server}/accounts"
+        try:
+            response = self.session.get(url, timeout=REQUEST_TIMEOUT)
+            data = json_or_text(response)
+            items = extract_accounts_payload(data)
+        except Exception as exc:
+            print(f"读取 YYB /accounts 异常：{str(exc)[:120]}")
+            return []
+
+        accounts: List[CodeAccount] = []
+        seen = set()
+        for item in items:
+            ref = extract_ref(item)
+            if not ref or ref in seen:
+                continue
+            seen.add(ref)
+            accounts.append(CodeAccount(label=extract_label(item, ref), ref=ref))
+
+        print(f"YYB /accounts 解析到 {len(accounts)} 个账号")
+        return accounts
+
+    def get_code(self, account: CodeAccount) -> Optional[str]:
+        """POST /wxapp/getCode 获取微信 code，指数退避重试"""
+        if not self.server:
+            print("未配置 YYB 服务地址，无法请求 /wxapp/getCode")
+            return None
+
+        url = f"{self.server}/wxapp/getCode"
+        payload = {"app_id": APPID, "ref": account.ref}
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 MicroMessenger/8.0.50",
+        }
+
+        for attempt in range(1, CODE_RETRY_TIMES + 1):
+            try:
+                response = self.session.post(
+                    url, json=payload, headers=headers, timeout=REQUEST_TIMEOUT
+                )
+                data = json_or_text(response)
+                code = extract_code(data)
+                if code:
+                    print(f"{mask(account.label)} 获取 wx code 成功")
+                    return code
+                print(f"{mask(account.label)} 获取 code 为空 resp={str(data)[:160]}")
+            except Exception as exc:
+                print(f"{mask(account.label)} 获取 code 异常：{str(exc)[:120]}")
+
+            if attempt < CODE_RETRY_TIMES:
+                sleep(RETRY_BASE_DELAY * attempt)
+
+        return None
 
 
 def parse_proxy_response(text: Any) -> Dict[str, Any] | None:
@@ -161,7 +301,15 @@ def parse_proxy_response(text: Any) -> Dict[str, Any] | None:
         if isinstance(data.get("data"), list) and data["data"]:
             proxy_obj = data["data"][0]
         elif isinstance(data.get("data"), dict):
-            proxy_obj = data["data"]
+            inner = data["data"]
+            # 支持嵌套 list 字段（如 data.list / data.rows）
+            for list_key in ("list", "rows", "data", "result", "proxies", "items"):
+                nested = inner.get(list_key)
+                if isinstance(nested, list) and nested:
+                    proxy_obj = nested[0]
+                    break
+            if proxy_obj is None:
+                proxy_obj = inner
         elif data.get("ip") and data.get("port"):
             proxy_obj = data
         elif isinstance(data.get("result"), dict):
@@ -180,12 +328,17 @@ def parse_proxy_response(text: Any) -> Dict[str, Any] | None:
     except Exception:
         pass
 
-    if ":" in text:
+    # 兜底：只对非 JSON 文本做 host:port 解析，并防御 int 异常
+    if ":" in text and not text.startswith("{"):
         parts = text.split(":")
         if len(parts) >= 2:
+            try:
+                port = int(parts[1])
+            except (ValueError, TypeError):
+                return None
             return {
                 "host": parts[0],
-                "port": int(parts[1]),
+                "port": port,
                 "username": parts[2] if len(parts) > 2 else "",
                 "password": parts[3] if len(parts) > 3 else "",
             }
@@ -315,24 +468,18 @@ def send_pushplus(title: str, content: str) -> None:
 
 
 def parse_yyb_go_entry(raw_value):
+    """解析旧版 YYB_SERVER 行（地址@ref），返回 (server, ref)；无 @ 视为纯服务地址。"""
     raw_value = (raw_value or "").strip()
     if not raw_value:
         return None, None
 
     if "@" not in raw_value:
-        print(f"❌ 配置错误：YYB_SERVER 格式应为 地址@微信账号标识，当前值：{raw_value}")
-        return None, None
+        server = normalize_server(raw_value)
+        return server, None
 
-    server, ref = raw_value.split("@", 1)
-    server = server.strip()
+    server, ref = raw_value.rsplit("@", 1)
+    server = normalize_server(server.strip())
     ref = ref.strip()
-
-    if server.startswith("http://"):
-        server = server[7:]
-    elif server.startswith("https://"):
-        server = server[8:]
-
-    server = server.rstrip("/")
 
     if not server or not ref:
         print(f"❌ 配置错误：YYB_SERVER 缺少地址或微信账号标识，当前值：{raw_value}")
@@ -340,33 +487,21 @@ def parse_yyb_go_entry(raw_value):
 
     return server, ref
 
-def get_code(server: str) -> str | None:
-    parsed_server, ref = parse_yyb_go_entry(server)
-    if not parsed_server or not ref:
-        return None
 
-    url = f"http://{parsed_server}/wxapp/getCode"
-    print(f"[{parsed_server}] 请求YYB Go获取code：{url}")
-
-    try:
-        res = requests.post(
-            url,
-            json={"ref": ref, "app_id": APPID},
-            timeout=20,
-            proxies={"http": None, "https": None},
-        )
-        data = res.json()
-        code = (((data.get("data") or {}).get("result") or {}).get("code"))
-
-        if data.get("code") != 0 or not code:
-            print(f"[{parsed_server}] 获取code失败：{data}")
-            return None
-
-        print(f"[{parsed_server}] 获取code成功")
-        return code
-    except Exception as exc:
-        print(f"[{parsed_server}] 获取code异常：{exc}")
-        return None
+def load_legacy_accounts() -> List[Tuple[CodeAccount, YybCodeProvider]]:
+    """从旧版 YYB_SERVER（每行 地址@ref）构建账号列表，兼容存量青龙配置。"""
+    pairs: List[Tuple[CodeAccount, YybCodeProvider]] = []
+    providers: Dict[str, YybCodeProvider] = {}
+    for line in os.getenv("YYB_SERVER", "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        server, ref = parse_yyb_go_entry(line)
+        if not server or not ref:
+            continue
+        provider = providers.setdefault(server, YybCodeProvider(server))
+        pairs.append((CodeAccount(label=ref, ref=ref), provider))
+    return pairs
 
 def common_headers(token: str | None = None) -> Dict[str, str]:
     headers = {
@@ -538,9 +673,10 @@ def build_withdraw_payload(trade_resp: Any) -> Tuple[Dict[str, Any] | None, str]
     }, f"可提现订单 {len(available)} 个，合计 {total_money:.2f} 元"
 
 
-def run_account(index: int, total: int, server: str) -> Dict[str, Any]:
+def run_account(account: CodeAccount, provider: YybCodeProvider) -> Dict[str, Any]:
+    server = provider.server
     result = {
-        "server": server,
+        "server": account.label,
         "success": False,
         "proxyStatus": "未使用代理",
         "proxyIp": "-",
@@ -552,9 +688,7 @@ def run_account(index: int, total: int, server: str) -> Dict[str, Any]:
         "error": "",
     }
 
-    log_account_header(index, total, server)
-
-    proxies, proxy_ip = get_valid_proxy(server)
+    proxies, proxy_ip = get_valid_proxy(account.label)
     result["proxyStatus"] = "使用专属代理" if proxies else "使用直连"
     result["proxyIp"] = proxy_ip or "-"
 
@@ -564,7 +698,7 @@ def run_account(index: int, total: int, server: str) -> Dict[str, Any]:
     print(f"⏳ [延迟] 启动延迟 {delay}s")
     sleep(delay)
 
-    code = get_code(server)
+    code = provider.get_code(account)
     if not code:
         result["error"] = "获取 code 失败"
         return result
@@ -701,18 +835,42 @@ def build_notify(results: List[Dict[str, Any]]) -> str:
 
 
 def main() -> None:
-    log_title()
+    if not SERVERS and not os.getenv("YYB_SERVER", "").strip():
+        print("❌ 未配置 code 服务，请设置 WECHAT_SERVER 或 YYB_SERVER 环境变量")
+        return
 
+    # Step 1: 先加载所有账号，再打标题（保证账号数量正确）
+    all_accounts: List[Tuple[CodeAccount, YybCodeProvider]] = []
+    for server in SERVERS:
+        provider = YybCodeProvider(server)
+        for account in provider.list_accounts():
+            all_accounts.append((account, provider))
+    if not all_accounts:
+        # 兼容旧 YYB_SERVER（地址@ref 行）配置
+        all_accounts = load_legacy_accounts()
+
+    log_title(len(all_accounts))
+
+    if not all_accounts:
+        print("❌ 未获取到任何账号")
+        return
+
+    # Step 2: 执行任务
     results: List[Dict[str, Any]] = []
 
-    for index, server in enumerate(SERVERS, 1):
+    for index, (account, provider) in enumerate(all_accounts, 1):
+        print()
+        print("┌" + "─" * 50 + "┐")
+        print(f"│ 🧩 账号 {index} / {len(all_accounts):<37}│")
+        print(f"│ 🌍 来源 {account.label:<40}│")
+        print("└" + "─" * 50 + "┘")
         try:
-            result = run_account(index, len(SERVERS), server)
+            result = run_account(account, provider)
             results.append(result)
         except Exception as exc:
-            print(f"❌ [主程序] {server} 执行异常: {exc}")
+            print(f"❌ [主程序] {account.label} 执行异常: {exc}")
             results.append({
-                "server": server,
+                "server": account.label,
                 "success": False,
                 "proxyStatus": "-",
                 "proxyIp": "-",
@@ -724,7 +882,7 @@ def main() -> None:
                 "error": traceback.format_exc().strip(),
             })
 
-        if index < len(SERVERS):
+        if index < len(all_accounts):
             print("⏳ [间隔] 等待 2s 后处理下一个账号")
             sleep(2)
 
