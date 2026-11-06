@@ -253,8 +253,8 @@ class YybCodeProvider:
         print(f"YYB /accounts 解析到 {len(accounts)} 个账号")
         return accounts
 
-    def get_code(self, account: CodeAccount) -> Optional[str]:
-        """POST /wxapp/getCode 获取微信 code，指数退避重试"""
+    def get_code_body(self, account: CodeAccount) -> Optional[Dict[str, Any]]:
+        """POST /wxapp/getCode，返回完整响应 dict（含 code/openid 等字段），重试耗尽返回 None"""
         if not self.server:
             print("未配置 YYB 服务地址，无法请求 /wxapp/getCode")
             return None
@@ -265,6 +265,9 @@ class YybCodeProvider:
             "Content-Type": "application/json",
             "User-Agent": "Mozilla/5.0 MicroMessenger/8.0.50",
         }
+        api_key = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
+        if api_key:
+            headers["Authorization"] = api_key if " " in api_key else "Bearer " + api_key
 
         for attempt in range(1, CODE_RETRY_TIMES + 1):
             try:
@@ -272,10 +275,9 @@ class YybCodeProvider:
                     url, json=payload, headers=headers, timeout=REQUEST_TIMEOUT
                 )
                 data = json_or_text(response)
-                code = extract_code(data)
-                if code:
+                if isinstance(data, dict) and extract_code(data):
                     print(f"{mask(account.label)} 获取 wx code 成功")
-                    return code
+                    return data
                 print(f"{mask(account.label)} 获取 code 为空 resp={str(data)[:160]}")
             except Exception as exc:
                 print(f"{mask(account.label)} 获取 code 异常：{str(exc)[:120]}")
@@ -284,6 +286,13 @@ class YybCodeProvider:
                 sleep(RETRY_BASE_DELAY * attempt)
 
         return None
+
+    def get_code(self, account: CodeAccount) -> Optional[str]:
+        """POST /wxapp/getCode 获取微信 code，指数退避重试"""
+        body = self.get_code_body(account)
+        if not body:
+            return None
+        return extract_code(body)
 
 
 def parse_proxy_response(text: Any) -> Dict[str, Any] | None:
