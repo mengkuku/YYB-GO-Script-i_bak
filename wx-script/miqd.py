@@ -20,7 +20,9 @@ import json
 import uuid
 import re
 import base64
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urljoin, urlparse
 import requests
 from requests.adapters import HTTPAdapter
@@ -49,6 +51,177 @@ FLOW_STEPS = 8
 CACHE_PATH = Path(os.getenv("MI_COMMUNITY_CACHE", "/ql/data/config/mi_community_sessions.json"))
 if not CACHE_PATH.parent.exists():
     CACHE_PATH = Path(__file__).resolve().with_name(".mi_community_sessions.json")
+
+# ============ YYB 相关（CodeProvider 模式） ============
+# 服务地址优先级：WECHAT_SERVER 环境变量 > YYB_SERVER（地址@ref 行，兼容旧配置）
+WECHAT_SERVER = os.getenv("WECHAT_SERVER", "").strip()
+SERVERS = [s.strip() for s in WECHAT_SERVER.split(",") if s.strip()]
+
+YYB_REFS: List[str] = []  # 空=自动从 /accounts 获取，非空=只用这里指定的 ref
+
+CODE_RETRY_TIMES = 3      # 获取 code 最大重试次数
+RETRY_BASE_DELAY = 3      # 指数退避基数（秒）
+
+
+def normalize_server(server: str) -> str:
+    """标准化服务地址：去末尾斜杠，补 http:// 前缀"""
+    server = str(server or "").strip().rstrip("/")
+    if not server.startswith("http://") and not server.startswith("https://"):
+        server = "http://" + server
+    return server
+
+
+def yyb_auth_headers() -> Dict[str, str]:
+    """YYB 协议鉴权头；未配置令牌时仅含 Content-Type。"""
+    headers = {"Content-Type": "application/json"}
+    api_key = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
+    if api_key:
+        headers["Authorization"] = api_key if " " in api_key else "Bearer " + api_key
+    return headers
+
+
+def json_or_text(response: requests.Response) -> Any:
+    try:
+        return response.json()
+    except Exception:
+        return response.text[:300]
+
+
+def extract_code(data: Any) -> str:
+    """从 YYB 服务多层响应结构中提取 code"""
+    if not isinstance(data, dict):
+        return ""
+    direct = data.get("code") or data.get("wx_code")
+    if direct not in (None, "", 0):
+        return str(direct)
+    nested = data.get("Data") or data.get("data") or {}
+    if isinstance(nested, dict):
+        nested_code = nested.get("code") or nested.get("wx_code")
+        if nested_code not in (None, "", 0):
+            return str(nested_code)
+        result = nested.get("result") or {}
+        if isinstance(result, dict):
+            result_code = result.get("code") or result.get("wx_code")
+            if result_code not in (None, "", 0):
+                return str(result_code)
+    return ""
+
+
+def extract_accounts_payload(data: Any) -> List[Any]:
+    """从 YYB /accounts 响应中提取账号列表（支持多层嵌套）"""
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    for key in ("accounts", "data", "list", "rows", "result"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            nested = extract_accounts_payload(value)
+            if nested:
+                return nested
+    return []
+
+
+def extract_ref(item: Any) -> str:
+    """从账号项中提取 ref 字段"""
+    if isinstance(item, str):
+        return item.strip()
+    if not isinstance(item, dict):
+        return ""
+    for key in ("ref", "openid", "openId", "wxid", "wx_id", "id", "account"):
+        value = item.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+
+def extract_label(item: Any, fallback: str) -> str:
+    """从账号项中提取显示名（remark > name > nickname > ... > fallback）"""
+    if not isinstance(item, dict):
+        return fallback
+    for key in ("remark", "name", "nickname", "nickName", "label", "wxid", "openid", "ref"):
+        value = item.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return fallback
+
+
+@dataclass
+class CodeAccount:
+    label: str   # 显示名称
+    ref: str     # 账号标识，提交给 /wxapp/getCode
+
+
+class YybCodeProvider:
+    def __init__(self, server: str):
+        self.server = normalize_server(server)
+        self.session = requests.Session()
+        self.session.verify = False
+
+    def list_accounts(self) -> List[CodeAccount]:
+        # 优先用手动配置的 YYB_REFS
+        refs = [str(x).strip() for x in YYB_REFS if str(x).strip()]
+        if refs:
+            return [CodeAccount(label=x, ref=x) for x in refs]
+
+        # 自动从 /accounts 获取
+        if not self.server:
+            print("未配置 YYB 服务地址，且 YYB_REFS 为空")
+            return []
+
+        url = f"{self.server}/accounts"
+        try:
+            response = self.session.get(url, timeout=20)
+            data = json_or_text(response)
+            items = extract_accounts_payload(data)
+        except Exception as exc:
+            print(f"读取 YYB /accounts 异常：{str(exc)[:120]}")
+            return []
+
+        accounts: List[CodeAccount] = []
+        seen = set()
+        for item in items:
+            ref = extract_ref(item)
+            if not ref or ref in seen:
+                continue
+            seen.add(ref)
+            accounts.append(CodeAccount(label=extract_label(item, ref), ref=ref))
+
+        print(f"YYB /accounts 解析到 {len(accounts)} 个账号")
+        return accounts
+
+    def get_code(self, account: CodeAccount) -> Optional[str]:
+        """POST /wxapp/getCode 获取微信 code，指数退避重试"""
+        if not self.server:
+            print("未配置 YYB 服务地址，无法请求 /wxapp/getCode")
+            return None
+
+        url = f"{self.server}/wxapp/getCode"
+        payload = {"app_id": APPID, "ref": account.ref}
+        headers = dict(yyb_auth_headers())
+        headers.setdefault("User-Agent", "Mozilla/5.0 MicroMessenger/8.0.50")
+
+        for attempt in range(1, CODE_RETRY_TIMES + 1):
+            try:
+                response = self.session.post(
+                    url, json=payload, headers=headers, timeout=20
+                )
+                data = json_or_text(response)
+                code = extract_code(data)
+                if code:
+                    return code
+                print(f"{account.label} 获取 code 为空 resp={str(data)[:160]}")
+            except Exception as exc:
+                print(f"{account.label} 获取 code 异常：{str(exc)[:120]}")
+
+            if attempt < CODE_RETRY_TIMES:
+                import time as _time
+                _time.sleep(RETRY_BASE_DELAY * attempt)
+
+        return None
+# =================================================
 
 
 def flow_start(step, message):
@@ -115,6 +288,7 @@ def save_cached_session(ref, source):
 
 
 def entries():
+    """兼容旧 YYB_SERVER（每行 地址@ref）；返回 [(server, ref), ...]。"""
     result = []
     selected_ref = os.getenv("MI_COMMUNITY_REF", "").strip()
     for raw in os.getenv("YYB_SERVER", "").splitlines():
@@ -130,16 +304,12 @@ def entries():
     return result
 
 
-def get_code(server, ref):
-    host = server if server.startswith(("http://", "https://")) else f"http://{server}"
+def get_code(provider, account):
+    host = provider.server
+    ref = account.ref
     # 用户信息操作可能较慢，必须先完成，再最后获取短时有效的一次性 code。
     flow_start(1, "从 YYB-Go 获取微信授权信息")
-    headers = {
-            "Content-Type": "application/json"
-        }
-    api_key = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
-    if api_key:
-        headers["Authorization"] = api_key if " " in api_key else "Bearer " + api_key
+    headers = yyb_auth_headers()
     user_info = requests.post(
         f"{host}/wxapp/operateWxData",
         json={
@@ -199,17 +369,9 @@ def get_code(server, ref):
     }
     flow_ok("微信授权信息获取成功")
     flow_start(2, "从 YYB-Go 获取一次性微信 code")
-    response = requests.post(
-        f"{host}/wxapp/getCode",
-        json={"ref": ref, "app_id": APPID},
-        timeout=20,
-        headers=headers,
-    )
-    response.raise_for_status()
-    body = response.json()
-    code = body.get("data", {}).get("result", {}).get("code")
-    if body.get("code") != 0 or not code:
-        raise RuntimeError(f"YYB 获取 code 失败（响应码：{body.get('code')}）")
+    code = provider.get_code(account)
+    if not code:
+        raise RuntimeError("YYB 获取 code 失败（重试后仍未取得）")
     flow_ok("一次性微信 code 获取成功")
     return code, user_result
 
@@ -355,8 +517,23 @@ def login_and_sign(code, wx_user_info, ref):
 
 
 def main():
-    accounts = entries()
-    if not accounts:
+    # Step 1: 先收集账号（WECHAT_SERVER /accounts 优先，YYB_SERVER 地址@ref 行兼容回退）
+    all_accounts: List[Tuple[CodeAccount, YybCodeProvider]] = []
+    for server in SERVERS:
+        provider = YybCodeProvider(server)
+        for account in provider.list_accounts():
+            all_accounts.append((account, provider))
+    if not all_accounts:
+        providers: Dict[str, YybCodeProvider] = {}
+        selected_ref = os.getenv("MI_COMMUNITY_REF", "").strip()
+        for server, ref in entries():
+            if selected_ref and ref != selected_ref:
+                continue
+            normalized = normalize_server(server)
+            provider = providers.setdefault(normalized, YybCodeProvider(normalized))
+            all_accounts.append((CodeAccount(label=ref, ref=ref), provider))
+
+    if not all_accounts:
         message = "❌ 未配置 YYB_SERVER"
         print(message)
         send_notification([message])
@@ -364,28 +541,29 @@ def main():
     failed = 0
     results = []
     print(f"\n{'=' * 54}")
-    print(f"{SCRIPT_NAME}开始，共读取到 {len(accounts)} 个 YYB 账号")
+    print(f"{SCRIPT_NAME}开始，共读取到 {len(all_accounts)} 个 YYB 账号")
     print(f"{'=' * 54}")
-    for index, (server, ref) in enumerate(accounts, 1):
+    # Step 2: 执行任务
+    for index, (account, provider) in enumerate(all_accounts, 1):
         print(f"\n{'─' * 54}")
-        print(f"账号 {index}/{len(accounts)}｜YYB 标识：{ref}")
+        print(f"账号 {index}/{len(all_accounts)}｜YYB 标识：{account.ref}")
         print(f"{'─' * 54}")
         try:
-            code, wx_user_info = get_code(server, ref)
-            result = login_and_sign(code, wx_user_info, ref)
-            line = f"账号 {ref}：✅ {result}"
-            print(f"  🏁 账号 {ref} 流程完成：{result}")
+            code, wx_user_info = get_code(provider, account)
+            result = login_and_sign(code, wx_user_info, account.ref)
+            line = f"账号 {account.ref}：✅ {result}"
+            print(f"  🏁 账号 {account.ref} 流程完成：{result}")
             results.append(line)
         except Exception as exc:  # 单账号失败不影响其他账号
             failed += 1
-            print(f"  🛑 账号 {ref} 流程终止：{exc}")
-            results.append(f"账号 {ref}：❌ {exc}")
+            print(f"  🛑 账号 {account.ref} 流程终止：{exc}")
+            results.append(f"账号 {account.ref}：❌ {exc}")
     print(f"\n{'=' * 54}")
-    print(f"执行汇总：成功 {len(accounts) - failed}，失败 {failed}，共 {len(accounts)} 个账号")
+    print(f"执行汇总：成功 {len(all_accounts) - failed}，失败 {failed}，共 {len(all_accounts)} 个账号")
     print(f"{'=' * 54}")
-    results.extend(["", f"汇总：成功 {len(accounts) - failed}，失败 {failed}，共 {len(accounts)} 个账号"])
+    results.extend(["", f"汇总：成功 {len(all_accounts) - failed}，失败 {failed}，共 {len(all_accounts)} 个账号"])
     send_notification(results)
-    return 1 if failed == len(accounts) else 0
+    return 1 if failed == len(all_accounts) else 0
 
 
 if __name__ == "__main__":
