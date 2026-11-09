@@ -120,10 +120,108 @@ function getYybEntries() {
         .filter(Boolean);
 }
 
-const YYB_ENTRIES = getYybEntries();
-if (!process.env.WX_ID && YYB_ENTRIES.length) {
-    process.env.WX_ID = YYB_ENTRIES.map(item => item.ref).join('\n');
+// YYB_SERVER 中只填地址（无 @ref）的行
+function getBareYybServers() {
+    const servers = [];
+    for (const line of String(process.env.YYB_SERVER || '').split(/\r?\n/)) {
+        const value = line.trim();
+        if (!value) continue;
+        const at = value.lastIndexOf('@');
+        if (at >= 1) continue;
+        let server = value.replace(/\/+$/, '');
+        if (server && !/^https?:\/\//i.test(server)) server = `http://${server}`;
+        if (server) servers.push(server);
+    }
+    return [...new Set(servers)];
 }
+
+function _yybAuthHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    const token = String(process.env.YYB_API_KEY || '').trim() || String(process.env.YYB_PROTOCOL_TOKEN || '').trim();
+    if (token) headers.Authorization = token.includes(' ') ? token : `Bearer ${token}`;
+    return headers;
+}
+
+// 从 /accounts 任意响应结构中提取账号 ref 列表
+function extractYybRefs(data) {
+    for (let depth = 0; depth < 5 && data && !Array.isArray(data); depth++) {
+        if (typeof data === 'string') {
+            try { data = JSON.parse(data); } catch { return []; }
+            continue;
+        }
+        const next = ['data', 'list', 'rows', 'result', 'accounts']
+            .map(k => (data || {})[k]).find(v => Array.isArray(v) && v.length);
+        if (next) { data = next; continue; }
+        const known = ['data', 'list', 'rows', 'result', 'accounts']
+            .find(k => (data || {})[k] !== undefined);
+        if (known) { data = data[known]; continue; }
+        if (typeof data === 'object' && data) {
+            // 旧 dict 形态 {openid: {...}}：键名即 ref，注入 item 再展开
+            const entries = Object.entries(data);
+            if (entries.length && entries.every(([, v]) => v && typeof v === 'object' && !Array.isArray(v))) {
+                data = entries.map(([k, v]) => ({ ref: k, ...v }));
+            } else {
+                data = entries.map(([, v]) => v);
+            }
+            continue;
+        }
+        return [];
+    }
+    if (!Array.isArray(data)) return [];
+    const refs = [];
+    const seen = new Set();
+    for (const item of data) {
+        let ref = '';
+        if (typeof item === 'string') ref = item.trim();
+        else if (item && typeof item === 'object') {
+            for (const key of ['ref', 'openid', 'openId', 'wxid', 'wx_id', 'id', 'account']) {
+                if (item[key] !== undefined && item[key] !== null && String(item[key]).trim()) {
+                    ref = String(item[key]).trim();
+                    break;
+                }
+            }
+        }
+        if (ref && !seen.has(ref)) { seen.add(ref); refs.push(ref); }
+    }
+    return refs;
+}
+
+// 从 YYB 服务 /accounts 自动发现账号（异步；仅纯地址行）
+async function discoverYybEntriesFromServers() {
+    const entries = [];
+    for (const server of getBareYybServers()) {
+        try {
+            const response = await axios.get(`${server}/accounts`, {
+                timeout: 15000,
+                proxy: false,
+                validateStatus: () => true,
+                headers: _yybAuthHeaders(),
+            });
+            const refs = extractYybRefs(response.data);
+            if (!refs.length) {
+                log(`⚠️ ${server} /accounts 未解析到账号（请确认 YYB 服务在线且已授权）`);
+                continue;
+            }
+            log(`✅ ${server} 自动发现 ${refs.length} 个账号`);
+            for (const ref of refs) entries.push({ server, ref });
+        } catch (error) {
+            log(`⚠️ 读取 ${server}/accounts 失败: ${error?.message || error}`);
+        }
+    }
+    return entries;
+}
+
+let YYB_ENTRIES = getYybEntries();
+// 启动时若只配了服务地址，自动从 /accounts 补全账号列表
+(async () => {
+    if (!process.env.WX_ID) {
+        const discovered = await discoverYybEntriesFromServers();
+        if (discovered.length) {
+            YYB_ENTRIES = YYB_ENTRIES.concat(discovered);
+            process.env.WX_ID = YYB_ENTRIES.map(item => item.ref).join('\n');
+        }
+    }
+})();
 
 function findYybEntry(identifier) {
     const raw = String(identifier || '').split('#')[0].trim();
@@ -139,13 +237,6 @@ function selectYybEntry(identifier) {
     if (found) return found;
     if (YYB_ENTRIES.length === 1) return YYB_ENTRIES[0];
     throw new Error(`YYB_SERVER 中找不到账号ref：${raw}`);
-}
-
-function _yybAuthHeaders() {
-    const headers = { 'Content-Type': 'application/json' };
-    const token = String(process.env.YYB_API_KEY || '').trim() || String(process.env.YYB_PROTOCOL_TOKEN || '').trim();
-    if (token) headers.Authorization = `Bearer ${token}`;
-    return headers;
 }
 
 async function yybPost(identifier, appId, route, payload) {

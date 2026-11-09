@@ -17,23 +17,97 @@ function parseYybGoEntry(rawValue) {
     if (!value) return { server: "", ref: "" };
     const atIndex = value.indexOf("@");
     if (atIndex === -1) {
-        console.log("YYB_SERVER 格式应为 地址@微信账号标识，当前值: " + value);
-        return { server: "", ref: "" };
+        return { server: value, ref: "" };  // 纯服务地址：ref 留空，由 /accounts 自动发现
     }
     let server = value.slice(0, atIndex).trim();
     const ref = value.slice(atIndex + 1).trim();
     if (server.startsWith("http://")) server = server.slice(7);
     else if (server.startsWith("https://")) server = server.slice(8);
     server = server.replace(/\/+$/, "");
-    if (!server || !ref) return { server: "", ref: "" };
+    if (!server || !ref) return { server, ref: "" };
     return { server, ref };
+}
+
+function yybAuthHeaders() {
+    const headers = { "Content-Type": "application/json" };
+    const token = String(process.env.YYB_API_KEY || "").trim() || String(process.env.YYB_PROTOCOL_TOKEN || "").trim();
+    if (token) headers.Authorization = token.includes(" ") ? token : `Bearer ${token}`;
+    return headers;
+}
+
+// 从 YYB 服务 GET /accounts 自动发现账号 ref（支持多层嵌套/旧 dict 结构）
+function extractYybRefs(data) {
+    for (let depth = 0; depth < 5 && data && !Array.isArray(data); depth++) {
+        if (typeof data === "string") {
+            try { data = JSON.parse(data); } catch { return []; }
+            continue;
+        }
+        const next = ["data", "list", "rows", "result", "accounts"]
+            .map(k => (data || {})[k]).find(v => Array.isArray(v) && v.length);
+        if (next) { data = next; continue; }
+        const known = ["data", "list", "rows", "result", "accounts"]
+            .find(k => (data || {})[k] !== undefined);
+        if (known) { data = data[known]; continue; }
+        if (typeof data === "object" && data) {
+            // 旧 dict 形态 {openid: {...}}：键名即 ref，注入 item 再展开
+            const entries = Object.entries(data);
+            if (entries.length && entries.every(([, v]) => v && typeof v === "object" && !Array.isArray(v))) {
+                data = entries.map(([k, v]) => ({ ref: k, ...v }));
+            } else {
+                data = entries.map(([, v]) => v);
+            }
+            continue;
+        }
+        return [];
+    }
+    if (!Array.isArray(data)) return [];
+    const refs = [];
+    const seen = new Set();
+    for (const item of data) {
+        let ref = "";
+        if (typeof item === "string") ref = item.trim();
+        else if (item && typeof item === "object") {
+            for (const key of ["ref", "openid", "openId", "wxid", "wx_id", "id", "account"]) {
+                if (item[key] !== undefined && item[key] !== null && String(item[key]).trim()) {
+                    ref = String(item[key]).trim();
+                    break;
+                }
+            }
+        }
+        if (ref && !seen.has(ref)) { seen.add(ref); refs.push(ref); }
+    }
+    return refs;
+}
+
+// YYB_SERVER 中只填地址（无 @ref）的行：自动从 /accounts 发现账号，展开成 地址@ref
+async function expandBareYybServers() {
+    const expanded = [];
+    for (const line of SERVERS) {
+        const parsed = parseYybGoEntry(line);
+        if (parsed.server && parsed.ref) { expanded.push(line); continue; }
+        if (!parsed.server) { console.log("YYB_SERVER 格式应为 地址@微信账号标识，当前值: " + line); continue; }
+        const url = "http://" + parsed.server.replace(/^https?:\/\//, "") + "/accounts";
+        try {
+            const { data } = await axios.get(url, { timeout: 15000, proxy: false, headers: yybAuthHeaders() });
+            const refs = extractYybRefs(data);
+            if (!refs.length) {
+                console.log(`⚠️ ${parsed.server} /accounts 未解析到账号（请确认 YYB 服务在线且已授权）`);
+                continue;
+            }
+            console.log(`✅ ${parsed.server} 自动发现 ${refs.length} 个账号`);
+            for (const ref of refs) expanded.push(`${parsed.server}@${ref}`);
+        } catch (e) {
+            console.log(`⚠️ 读取 ${parsed.server}/accounts 失败: ${e.message || e}`);
+        }
+    }
+    return expanded;
 }
 async function getCode(server) {
     const { server: parsedServer, ref } = parseYybGoEntry(server);
     if (!parsedServer || !ref) return null;
     const url = "http://" + parsedServer + "/wxapp/getCode";
     try {
-        const { data } = await axios.post(url, { ref, app_id: MINI_APP_ID }, { timeout: 20000, proxy: false });
+        const { data } = await axios.post(url, { ref, app_id: MINI_APP_ID }, { timeout: 20000, proxy: false, headers: yybAuthHeaders() });
         const code = data && data.data && data.data.result && data.data.result.code;
         if (!data || data.code !== 0 || !code) {
             console.log(parsedServer + " 获取code失败: " + JSON.stringify(data));
@@ -306,8 +380,12 @@ class Task {
 }
 
 !(async () => {
-
-    for (const openid of SERVERS) {
+    const accounts = await expandBareYybServers();
+    if (!accounts.length) {
+        console.error("YYB_SERVER 中没有可用账号（支持 地址@微信账号标识 每行一条，或只填服务地址自动发现全部账号）");
+        process.exit(1);
+    }
+    for (const openid of accounts) {
         await new Task(openid).run();
     }
 })()

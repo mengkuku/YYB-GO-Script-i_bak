@@ -1380,7 +1380,7 @@ function parseYYBServer(raw) {
 function _yybAuthHeaders() {
     const headers = { 'Content-Type': 'application/json' };
     const token = String(process.env.YYB_API_KEY || '').trim() || String(process.env.YYB_PROTOCOL_TOKEN || '').trim();
-    if (token) headers.Authorization = `Bearer ${token}`;
+    if (token) headers.Authorization = token.includes(' ') ? token : `Bearer ${token}`;
     return headers;
 }
 
@@ -2813,9 +2813,83 @@ async function main() {
     throw new Error('未设置变量 YYB_SERVER');
   }
 
-  const yybEntries = parseYYBServer(RAW_YYB_SERVER);
+  let yybEntries = parseYYBServer(RAW_YYB_SERVER);
+  // 只填地址（无 @ref）的行：自动从 YYB 服务 /accounts 发现账号
+  const bareServers = [];
+  for (const line of RAW_YYB_SERVER.split(/\r?\n/)) {
+    const value = line.trim();
+    if (!value) continue;
+    const at = value.lastIndexOf('@');
+    if (at > 0 && at < value.length - 1) continue;
+    // 排除已带 ref 的行后，剩余即纯地址；先剥掉可能的 @ 结尾异常再补协议
+    let server = value.split('@')[0].trim().replace(/\/+$/, '');
+    if (!/^https?:\/\//i.test(server)) server = `http://${server}`;
+    if (server) bareServers.push(server);
+  }
+  for (const server of [...new Set(bareServers)]) {
+    try {
+      const { data } = await request('GET', `${server}/accounts`, { headers: _yybAuthHeaders(), timeout: 15000 });
+      const refs = (() => {
+        let node = data;
+        for (let depth = 0; depth < 5 && node && !Array.isArray(node); depth++) {
+          if (typeof node === 'string') {
+            try { node = JSON.parse(node); } catch { return []; }
+            continue;
+          }
+          const next = ['data', 'list', 'rows', 'result', 'accounts']
+            .map(k => (node || {})[k]).find(v => Array.isArray(v) && v.length);
+          if (next) { node = next; continue; }
+          const known = ['data', 'list', 'rows', 'result', 'accounts'].find(k => (node || {})[k] !== undefined);
+          if (known) { node = node[known]; continue; }
+          if (typeof node === 'object' && node) {
+            const entries = Object.entries(node);
+            if (entries.length && entries.every(([, v]) => v && typeof v === 'object' && !Array.isArray(v))) {
+              node = entries.map(([k, v]) => ({ ref: k, ...v }));
+            } else {
+              node = entries.map(([, v]) => v);
+            }
+            continue;
+          }
+          return [];
+        }
+        if (!Array.isArray(node)) return [];
+        const refs = [];
+        const seen = new Set();
+        for (const item of node) {
+          let ref = '';
+          if (typeof item === 'string') ref = item.trim();
+          else if (item && typeof item === 'object') {
+            for (const key of ['ref', 'openid', 'openId', 'wxid', 'wx_id', 'id', 'account']) {
+              if (item[key] !== undefined && item[key] !== null && String(item[key]).trim()) {
+                ref = String(item[key]).trim();
+                break;
+              }
+            }
+          }
+          if (ref && !seen.has(ref)) { seen.add(ref); refs.push(ref); }
+        }
+        return refs;
+      })();
+      if (!refs.length) {
+        console.log(`⚠️ ${server} /accounts 未解析到账号（请确认 YYB 服务在线且已授权）`);
+        continue;
+      }
+      console.log(`✅ ${server} 自动发现 ${refs.length} 个账号`);
+      for (const ref of refs) yybEntries.push({ server, ref, remark: `账号${yybEntries.length + 1}` });
+    } catch (error) {
+      console.log(`⚠️ 读取 ${server}/accounts 失败: ${error?.message || error}`);
+    }
+  }
+  // 同一 server@ref 去重
+  const seenKeys = new Set();
+  yybEntries = yybEntries.filter(e => {
+    const key = `${e.server}@${e.ref}`;
+    if (seenKeys.has(key)) return false;
+    seenKeys.add(key);
+    return true;
+  });
   if (!yybEntries.length) {
-    throw new Error('YYB_SERVER解析失败，请按“地址@微信账号标识”每行一个账号配置');
+    throw new Error('YYB_SERVER 没有可用账号；支持 地址@微信账号标识 每行一个，或只填服务地址自动发现全部账号');
   }
 
   const cache = loadCache();

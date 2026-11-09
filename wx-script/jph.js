@@ -421,18 +421,109 @@ function $await(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function normalizeYybServer(rawValue) {
+    let server = String(rawValue || '').trim().replace(/\/+$/, '');
+    if (server && !/^https?:\/\//i.test(server)) server = `http://${server}`;
+    return server;
+}
+
+function yybAuthHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    const token = String(process.env.YYB_API_KEY || '').trim() || String(process.env.YYB_PROTOCOL_TOKEN || '').trim();
+    if (token) headers.Authorization = token.includes(' ') ? token : `Bearer ${token}`;
+    return headers;
+}
+
+// 从 YYB 服务 GET /accounts 自动发现账号 ref（支持多层嵌套结构）
+async function fetchYybAccountRefs(server) {
+    try {
+        const response = await axios.get(`${server}/accounts`, {
+            timeout: 15000,
+            proxy: false,
+            validateStatus: () => true,
+            headers: yybAuthHeaders()
+        });
+        return extractYybRefs(response.data);
+    } catch (e) {
+        log(`读取 ${server}/accounts 异常：${e.message || e}`);
+        return [];
+    }
+}
+
+// 从 /accounts 任意响应结构中提取账号 ref 列表
+function extractYybRefs(data) {
+    for (let depth = 0; depth < 5 && data && !Array.isArray(data); depth++) {
+        if (typeof data === 'string') {
+            try { data = JSON.parse(data); } catch { return []; }
+            continue;
+        }
+        const next = ['data', 'list', 'rows', 'result', 'accounts']
+            .map(k => (data || {})[k]).find(v => Array.isArray(v) && v.length);
+        if (next) { data = next; continue; }
+        const known = ['data', 'list', 'rows', 'result', 'accounts']
+            .find(k => (data || {})[k] !== undefined);
+        if (known) { data = data[known]; continue; }
+        if (typeof data === 'object' && data) {
+            // 旧 dict 形态 {openid: {...}}：键名即 ref，注入 item 再展开
+            const entries = Object.entries(data);
+            if (entries.length && entries.every(([, v]) => v && typeof v === 'object' && !Array.isArray(v))) {
+                data = entries.map(([k, v]) => ({ ref: k, ...v }));
+            } else {
+                data = entries.map(([, v]) => v);
+            }
+            continue;
+        }
+        return [];
+    }
+    if (!Array.isArray(data)) return [];
+    const refs = [];
+    const seen = new Set();
+    for (const item of data) {
+        let ref = '';
+        if (typeof item === 'string') ref = item.trim();
+        else if (item && typeof item === 'object') {
+            for (const key of ['ref', 'openid', 'openId', 'wxid', 'wx_id', 'id', 'account']) {
+                if (item[key] !== undefined && item[key] !== null && String(item[key]).trim()) {
+                    ref = String(item[key]).trim();
+                    break;
+                }
+            }
+        }
+        if (ref && !seen.has(ref)) { seen.add(ref); refs.push(ref); }
+    }
+    return refs;
+}
+
 // 环境处理
 async function Envs() {
     if (!YYB_SERVER.trim()) {
-        log(`未填写变量 YYB_SERVER，格式：地址@账号标识，多账号一行一个`);
+        log(`未填写变量 YYB_SERVER，格式：地址@账号标识，多账号一行一个；只填地址时自动从 /accounts 获取全部账号`);
         return false;
     }
-    xjhdArr = YYB_SERVER.split(/\r?\n/).map(i => i.trim()).filter(i => {
-        if (!i) return false;
-        const parsed = parseYybGoEntry(i);
-        if (!parsed.server || !parsed.ref) log(`跳过无效 YYB_SERVER 配置：${i}`);
-        return parsed.server && parsed.ref;
-    });
+    const bareServers = [];
+    for (const raw of YYB_SERVER.split(/\r?\n/)) {
+        const line = raw.trim();
+        if (!line) continue;
+        const parsed = parseYybGoEntry(line);
+        if (parsed.server && parsed.ref) {
+            xjhdArr.push(line);
+            continue;
+        }
+        // 无 @ref：视为纯服务地址，自动从 /accounts 拉全部账号
+        const server = normalizeYybServer(line);
+        if (!server) { log(`跳过无效 YYB_SERVER 配置：${line}`); continue; }
+        bareServers.push(server);
+    }
+    for (const server of bareServers) {
+        const refs = await fetchYybAccountRefs(server);
+        if (!refs.length) {
+            log(`⚠️ ${server} /accounts 未解析到账号（请确认 YYB 服务在线且已授权）`);
+            continue;
+        }
+        log(`✅ ${server} 自动发现 ${refs.length} 个账号`);
+        for (const ref of refs) xjhdArr.push(`${server}@${ref}`);
+    }
+    xjhdArr = [...new Set(xjhdArr)];
     if (!xjhdArr.length) {
         log(`YYB_SERVER 中没有有效账号`);
         return false;

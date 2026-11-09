@@ -60,6 +60,84 @@ function compact(value, max = 160) {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
+function _yybAuthHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    const token = String(process.env.YYB_API_KEY || '').trim() || String(process.env.YYB_PROTOCOL_TOKEN || '').trim();
+    if (token) headers.Authorization = token.includes(' ') ? token : `Bearer ${token}`;
+    return headers;
+}
+
+// 从 /accounts 任意响应结构中提取账号 ref 列表
+function extractYybRefs(data) {
+  for (let depth = 0; depth < 5 && data && !Array.isArray(data); depth++) {
+    if (typeof data === 'string') {
+      try { data = JSON.parse(data); } catch { return []; }
+      continue;
+    }
+    const next = ['data', 'list', 'rows', 'result', 'accounts']
+      .map(k => (data || {})[k]).find(v => Array.isArray(v) && v.length);
+    if (next) { data = next; continue; }
+    const known = ['data', 'list', 'rows', 'result', 'accounts']
+      .find(k => (data || {})[k] !== undefined);
+    if (known) { data = data[known]; continue; }
+    if (typeof data === 'object' && data) {
+      // 旧 dict 形态 {openid: {...}}：键名即 ref，注入 item 再展开
+      const entries = Object.entries(data);
+      if (entries.length && entries.every(([, v]) => v && typeof v === 'object' && !Array.isArray(v))) {
+        data = entries.map(([k, v]) => ({ ref: k, ...v }));
+      } else {
+        data = entries.map(([, v]) => v);
+      }
+      continue;
+    }
+    return [];
+  }
+  if (!Array.isArray(data)) return [];
+  const refs = [];
+  const seen = new Set();
+  for (const item of data) {
+    let ref = '';
+    if (typeof item === 'string') ref = item.trim();
+    else if (item && typeof item === 'object') {
+      for (const key of ['ref', 'openid', 'openId', 'wxid', 'wx_id', 'id', 'account']) {
+        if (item[key] !== undefined && item[key] !== null && String(item[key]).trim()) {
+          ref = String(item[key]).trim();
+          break;
+        }
+      }
+    }
+    if (ref && !seen.has(ref)) { seen.add(ref); refs.push(ref); }
+  }
+  return refs;
+}
+
+// 只填地址的行：自动从 YYB 服务 /accounts 发现账号
+async function discoverAccountsFromServers(raw) {
+  const bareServers = [];
+  for (const line of String(raw || '').split(/\r?\n/)) {
+    const value = line.trim();
+    if (!value) continue;
+    const at = value.lastIndexOf('@');
+    if (at <= 0 || at === value.length - 1) bareServers.push(normalizeServer(value));
+  }
+  const accounts = [];
+  for (const server of bareServers) {
+    try {
+      const response = await requestJson(`${server}/accounts`, { method: 'GET', headers: _yybAuthHeaders() }, 15000);
+      const refs = extractYybRefs(response.data);
+      if (!refs.length) {
+        console.log(`⚠️ ${server} /accounts 未解析到账号（请确认 YYB 服务在线且已授权）`);
+        continue;
+      }
+      console.log(`✅ ${server} 自动发现 ${refs.length} 个账号`);
+      for (const ref of refs) accounts.push({ server, ref, note: '' });
+    } catch (e) {
+      console.log(`⚠️ 读取 ${server}/accounts 失败: ${compact(e?.message || e)}`);
+    }
+  }
+  return accounts;
+}
+
 async function requestJson(url, options = {}, timeoutMs = 20000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -237,8 +315,19 @@ function notify() {
 }
 
 !(async () => {
-  const accounts = parseAccounts(process.env.YYB_SERVER);
-  if (!accounts.length) throw new Error('未找到 YYB_SERVER，请按 地址@账号标识 每行一条配置');
+  const raw = process.env.YYB_SERVER || '';
+  let accounts = [];
+  const parseError = (() => {
+    try { accounts = parseAccounts(raw); return null; }
+    catch (e) { return e; }
+  })();
+  // 只填地址（无 @ref）的行：自动从 /accounts 发现账号
+  const discovered = await discoverAccountsFromServers(raw);
+  accounts = accounts.filter(a => !discovered.some(d => d.server === a.server && d.ref === a.ref)).concat(discovered);
+  if (!accounts.length) {
+    const detail = parseError ? `（${compact(parseError?.message || parseError)}）` : '';
+    throw new Error(`未找到可用账号${detail}；YYB_SERVER 支持 地址@账号标识 每行一条，或只填服务地址自动发现全部账号`);
+  }
   console.log(`${SCRIPT_NAME}｜共 ${accounts.length} 个账号`);
   for (let i = 0; i < accounts.length; i += 1) {
     await runAccount(accounts[i], i + 1);

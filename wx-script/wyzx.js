@@ -1,17 +1,121 @@
-// YYB-Go-Enhanced 适配说明：配置多行 YYB_SERVER=地址@账号标识；通知使用青龙 sendNotify。
+// YYB-Go-Enhanced 适配说明：配置多行 YYB_SERVER=地址@账号标识；只填地址时自动从 /accounts 获取全部账号；通知使用青龙 sendNotify。
 // ===== YYB-Go-Enhanced + QingLong standalone adapter =====
+function normalizeYybServer(rawValue) {
+    let server = String(rawValue || '').trim().replace(/\/+$/, '');
+    if (server && !/^https?:\/\//i.test(server)) server = `http://${server}`;
+    return server;
+}
+
+function _yybAuthHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    const token = String(process.env.YYB_API_KEY || '').trim() || String(process.env.YYB_PROTOCOL_TOKEN || '').trim();
+    if (token) headers.Authorization = token.includes(' ') ? token : `Bearer ${token}`;
+    return headers;
+}
+
+// 从 /accounts 任意响应结构中提取账号 ref 列表
+function extractYybRefs(data) {
+    for (let depth = 0; depth < 5 && data && !Array.isArray(data); depth++) {
+        if (typeof data === 'string') {
+            try { data = JSON.parse(data); } catch { return []; }
+            continue;
+        }
+        const next = ['data', 'list', 'rows', 'result', 'accounts']
+            .map(k => (data || {})[k]).find(v => Array.isArray(v) && v.length);
+        if (next) { data = next; continue; }
+        const known = ['data', 'list', 'rows', 'result', 'accounts']
+            .find(k => (data || {})[k] !== undefined);
+        if (known) { data = data[known]; continue; }
+        if (typeof data === 'object' && data) {
+            // 旧 dict 形态 {openid: {...}}：键名即 ref，注入 item 再展开
+            const entries = Object.entries(data);
+            if (entries.length && entries.every(([, v]) => v && typeof v === 'object' && !Array.isArray(v))) {
+                data = entries.map(([k, v]) => ({ ref: k, ...v }));
+            } else {
+                data = entries.map(([, v]) => v);
+            }
+            continue;
+        }
+        return [];
+    }
+    if (!Array.isArray(data)) return [];
+    const refs = [];
+    const seen = new Set();
+    for (const item of data) {
+        let ref = '';
+        if (typeof item === 'string') ref = item.trim();
+        else if (item && typeof item === 'object') {
+            for (const key of ['ref', 'openid', 'openId', 'wxid', 'wx_id', 'id', 'account']) {
+                if (item[key] !== undefined && item[key] !== null && String(item[key]).trim()) {
+                    ref = String(item[key]).trim();
+                    break;
+                }
+            }
+        }
+        if (ref && !seen.has(ref)) { seen.add(ref); refs.push(ref); }
+    }
+    return refs;
+}
+
+// 从 YYB 服务 GET /accounts 自动发现账号 ref
+async function _fetchYybAccountRefs(server) {
+    try {
+        const response = await axios.get(`${normalizeYybServer(server)}/accounts`, {
+            timeout: 15000, headers: _yybAuthHeaders() });
+        return extractYybRefs(response.data);
+    } catch (error) {
+        console.log(`读取 ${server}/accounts 异常：${error?.message || error}`);
+        return [];
+    }
+}
+
+let _resolvedRoutes = null;
+async function _yybRoutesResolved() {
+    if (_resolvedRoutes) return _resolvedRoutes;
+    const lines = String(process.env.YYB_SERVER || '').split(/\r?\n/).map(v => v.trim()).filter(Boolean);
+    const routes = [];
+    const bareServers = [];
+    for (const line of lines) {
+        const at = line.lastIndexOf('@');
+        if (at > 0 && at < line.length - 1) {
+            let server = line.slice(0, at).trim().replace(/\/+$/, '');
+            if (!/^https?:\/\//i.test(server)) server = `http://${server}`;
+            routes.push({ server, ref: line.slice(at + 1).trim() });
+        } else {
+            const server = normalizeYybServer(line);
+            if (server) bareServers.push(server);
+        }
+    }
+    // 只填地址的行：自动从 /accounts 发现账号
+    for (const server of bareServers) {
+        const refs = await _fetchYybAccountRefs(server);
+        for (const ref of refs) routes.push({ server, ref });
+    }
+    // 同一 server@ref 去重
+    const seen = new Set();
+    _resolvedRoutes = routes.filter(r => {
+        const key = `${r.server}@${r.ref}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+    return _resolvedRoutes;
+}
+
 function _yybRoutes() {
+    if (_resolvedRoutes) return _resolvedRoutes;
+    // 同步上下文（无 await 可用时）只能用已配置的 地址@ref 行
     const routes = String(process.env.YYB_SERVER || '').split(/\r?\n/)
         .map(v => v.trim()).filter(Boolean).map((line, index) => {
             const at = line.lastIndexOf('@');
             if (at <= 0 || at >= line.length - 1) {
-                throw new Error(`YYB_SERVER 第 ${index + 1} 行格式错误，应为 地址@账号标识`);
+                throw new Error(`YYB_SERVER 第 ${index + 1} 行格式错误，应为 地址@账号标识（或只填地址以自动发现账号）`);
             }
             let server = line.slice(0, at).trim().replace(/\/+$/, '');
             if (!/^https?:\/\//i.test(server)) server = `http://${server}`;
             return { server, ref: line.slice(at + 1).trim() };
         });
-    if (!routes.length) throw new Error('未配置 YYB_SERVER（每行：地址@账号标识）');
+    if (!routes.length) throw new Error('未配置 YYB_SERVER（每行：地址@账号标识，或只填地址以自动发现账号）');
     return routes;
 }
 
@@ -19,8 +123,8 @@ function _yybCleanRef(value) {
     return String(value || '').split('#')[0].replace(/^(wx|yyb|wmpf|syzs):/i, '').trim();
 }
 
-function _yybRouteFor(identifier) {
-    const routes = _yybRoutes();
+async function _yybRouteFor(identifier) {
+    const routes = await _yybRoutesResolved();
     const wanted = _yybCleanRef(identifier);
     const exact = routes.find(x => _yybCleanRef(x.ref) === wanted);
     if (exact) return exact;
@@ -29,15 +133,8 @@ function _yybRouteFor(identifier) {
     throw new Error(`YYB_SERVER 中找不到账号标识：${wanted || '(空)'}`);
 }
 
-function _yybAuthHeaders() {
-    const headers = { 'Content-Type': 'application/json' };
-    const token = String(process.env.YYB_API_KEY || '').trim() || String(process.env.YYB_PROTOCOL_TOKEN || '').trim();
-    if (token) headers.Authorization = `Bearer ${token}`;
-    return headers;
-}
-
 async function getSingleCode(appId, identifier) {
-    const route = _yybRouteFor(identifier);
+    const route = await _yybRouteFor(identifier);
     const headers = _yybAuthHeaders();
     const response = await axios.post(`${route.server}/wxapp/getCode`,
         { ref: route.ref, app_id: appId },
@@ -55,7 +152,7 @@ async function _resolveYybAccounts(envName = '') {
     const structured = new Set(['qmai', 'quncrm']);
     const configured = structured.has(envName) ? String(process.env[envName] || '').trim() : '';
     if (configured) return configured.split(/[\r\n&]+/).map(v => v.trim()).filter(Boolean);
-    return _yybRoutes().map(x => x.ref);
+    return (await _yybRoutesResolved()).map(x => x.ref);
 }
 global.getSingleCode = getSingleCode;
 global.resolveAccounts = _resolveYybAccounts;
