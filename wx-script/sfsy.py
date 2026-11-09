@@ -215,6 +215,99 @@ def parse_fixed_proxy(fixed_proxy: str) -> Optional[Dict[str, str]]:
 # ==================== AutoCookieManager ====================
 UCMP_BASE = "https://ucmp.sf-express.com"
 
+# ===================== YYB CodeProvider 模式 =====================
+# 服务地址优先级：WECHAT_SERVER 环境变量 > YYB_SERVER（地址@ref 行，兼容旧配置）
+WECHAT_SERVER = os.getenv("WECHAT_SERVER", "").strip()
+SERVERS = [s.strip() for s in WECHAT_SERVER.split(",") if s.strip()]
+
+YYB_REFS: List[str] = []  # 空=自动从 /accounts 获取，非空=只用这里指定的 ref
+
+CODE_RETRY_TIMES = 3      # 获取 code 最大重试次数
+RETRY_BASE_DELAY = 3      # 指数退避基数（秒）
+
+
+class YybCodeProvider:
+    """SF 小程序取码 provider：/accounts 发现账号 + /wxapp/getCode 取码。"""
+
+    def __init__(self, server: str):
+        server = (server or "").strip().rstrip("/")
+        if server and not server.startswith(("http://", "https://")):
+            server = "http://" + server
+        self.server = server
+        self.appid = SF_WX_APPID
+        self.session = requests.Session()
+        self.session.verify = False
+
+    def list_accounts(self) -> List[str]:
+        # 优先用手动配置的 YYB_REFS
+        refs = [str(x).strip() for x in YYB_REFS if str(x).strip()]
+        if refs:
+            return refs
+
+        # 自动从 /accounts 获取
+        if not self.server:
+            return []
+        try:
+            r = self.session.get(f"{self.server}/accounts", timeout=REQUEST_TIMEOUT)
+            j = r.json()
+            if isinstance(j, dict) and j.get("code") not in (0, None):
+                return []
+            accounts = j.get("data") or []
+            if isinstance(accounts, dict):
+                accounts = list(accounts.values())
+            refs: List[str] = []
+            seen = set()
+            for item in accounts:
+                if not isinstance(item, dict):
+                    continue
+                ref = ""
+                for key in ("ref", "openid", "openId", "wxid", "wx_id", "id", "account"):
+                    value = item.get(key)
+                    if value not in (None, ""):
+                        ref = str(value).strip()
+                        break
+                if ref and ref not in seen:
+                    seen.add(ref)
+                    refs.append(ref)
+            return refs
+        except Exception:
+            return []
+
+    def get_code(self, ref: str) -> Optional[str]:
+        if not self.server:
+            return None
+
+        url = f"{self.server}/wxapp/getCode"
+        payload = {"app_id": self.appid, "ref": ref}
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 MicroMessenger/8.0.50",
+        }
+        api_key = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
+        if api_key:
+            headers["Authorization"] = api_key if " " in api_key else "Bearer " + api_key
+
+        for attempt in range(1, CODE_RETRY_TIMES + 1):
+            try:
+                response = self.session.post(
+                    url, json=payload, headers=headers, timeout=REQUEST_TIMEOUT
+                )
+                data = response.json()
+                inner = (data.get("data") or {})
+                result = inner.get("result") if isinstance(inner, dict) else {}
+                code = result.get("code") if isinstance(result, dict) else None
+                if data.get("code") == 0 and code:
+                    return str(code)
+                _log_global(f"⚠️ {ref[:12]}***: 获取code为空 resp={str(data)[:160]}")
+            except Exception as e:
+                _log_global(f"⚠️ {ref[:12]}***: 获取code异常 {str(e)[:80]}")
+
+            if attempt < CODE_RETRY_TIMES:
+                time.sleep(RETRY_BASE_DELAY * attempt)
+
+        return None
+# =================================================
+
 class AutoCookieManager:
     def __init__(self, wx_server: str = None):
         self.wx_server = (wx_server or SF_WX_SERVER).strip().rstrip("/")
@@ -244,73 +337,14 @@ class AutoCookieManager:
             return []
 
     def _get_wx_code(self, wxid: str, appid: str = None, max_retries: int = 3) -> Optional[str]:
-        """通过 POST /wxapp/getCode 获取微信 code
-
-        请求体: {"app_id": appid, "ref": wxid/openid}
-        成功响应: {"code":0,"msg":"success","data":{"openid":"...","result":{"code":"...","errMsg":"login:ok"}}}
-        """
-        if not self.wx_server:
-            _log_global("❌ 未配置 wx_server_url，无法请求 /wxapp/getCode")
-            return None
-        target_appid = appid or SF_WX_APPID
-        url = f"{self.wx_server}/wxapp/getCode"
-
-        for attempt in range(max_retries):
-            try:
-                payload = {"app_id": target_appid, "ref": wxid}
-                headers = {
-                    "Content-Type": "application/json",
-                    "User-Agent": "Mozilla/5.0 MicroMessenger/8.0.50",
-                }
-
-                r = self.session.post(url, json=payload, headers=headers, timeout=30)
-                j = r.json()
-
-                # 新接口: code==0 且 data.result.code 为微信 code
-                if j.get("code") == 0:
-                    data = j.get("data") or {}
-                    result = data.get("result") if isinstance(data, dict) else {}
-                    if isinstance(result, dict) and result.get("code"):
-                        return str(result["code"])
-                    if isinstance(data, dict):
-                        nested_code = data.get("code")
-                        if nested_code not in (None, "", 0):
-                            return str(nested_code)
-
-                # 兼容旧结构
-                if j.get("status") == "ok" and j.get("code") and not isinstance(j.get("code"), int):
-                    return str(j["code"])
-
-                data = j.get("Data") or j.get("data") or {}
-                code = ""
-                if isinstance(data, dict):
-                    result = data.get("result") or {}
-                    if isinstance(result, dict):
-                        code = result.get("code") or ""
-                    if not code:
-                        nested_code = data.get("code")
-                        if nested_code not in (None, "", 0):
-                            code = nested_code
-                if not code:
-                    code = j.get("wx_code") or ""
-
-                if not code:
-                    if attempt < max_retries - 1:
-                        wait = (attempt + 1) * 3
-                        _log_global(f"⚠️ {wxid[:12]}***: code为空，{wait}s后重试({attempt+1}/{max_retries})")
-                        time.sleep(wait)
-                        continue
-                    _log_global(f"❌ {wxid[:12]}***: 获取code失败 appid={target_appid} resp={str(j)[:160]}")
-                    return None
-                return str(code)
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    wait = (attempt + 1) * 3
-                    _log_global(f"⚠️ {wxid[:12]}***: code异常 {str(e)[:60]}，{wait}s后重试({attempt+1}/{max_retries})")
-                    time.sleep(wait)
-                    continue
-                _log_global(f"❌ {wxid[:12]}***: 获取code异常 appid={target_appid} err={str(e)[:80]}")
-                return None
+        """通过 YybCodeProvider 获取微信 code（重试+退避+鉴权头）。"""
+        provider = YybCodeProvider(self.wx_server or (SERVERS[0] if SERVERS else ""))
+        if appid and appid != provider.appid:
+            provider.appid = appid
+        code = provider.get_code(wxid)
+        if code:
+            return code
+        _log_global(f"❌ {wxid[:12]}***: 获取code失败 appid={appid or SF_WX_APPID}")
         return None
 
     def _ucmp_app_on_login(self, code: str) -> Optional[Dict]:
@@ -963,10 +997,15 @@ def run_account(account_raw: str, index: int) -> Dict[str, Any]:
 
 def _auto_fetch_cookies() -> List[str]:
     mgr = AutoCookieManager()
-    # 适配 YYB_SERVER：优先用解析到的 refs，否则回退到在线账号发现
-    if _SF_REFS:
+    # 账号来源：WECHAT_SERVER /accounts 自动发现优先，YYB_SERVER 地址@ref 行兼容回退
+    wxids: List[str] = []
+    for server in SERVERS:
+        wxids = YybCodeProvider(server).list_accounts()
+        if wxids:
+            break
+    if not wxids and _SF_REFS:
         wxids = _SF_REFS
-    else:
+    elif not wxids:
         wxids = [a.get("openid") or a.get("wxid") for a in mgr._get_online_accounts() if a.get("openid") or a.get("wxid")]
     if not wxids:
         return []
