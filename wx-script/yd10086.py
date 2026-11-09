@@ -51,9 +51,10 @@ import re
 import ssl
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import requests
@@ -282,6 +283,165 @@ def load_accounts() -> List[AccountTarget]:
 
 
 # --------------------------------------------------------------------------- #
+# YYB CodeProvider 模式
+# --------------------------------------------------------------------------- #
+# 服务地址优先级：WECHAT_SERVER 环境变量 > YYB_SERVER（地址@ref 行，兼容旧配置）
+WECHAT_SERVER = os.getenv("WECHAT_SERVER", "").strip()
+SERVERS = [s.strip() for s in WECHAT_SERVER.split(",") if s.strip()]
+
+YYB_REFS: List[str] = []  # 空=自动从 /accounts 获取，非空=只用这里指定的 ref
+
+CODE_RETRY_TIMES = 3      # 获取 code 最大重试次数
+RETRY_BASE_DELAY = 3      # 指数退避基数（秒）
+
+
+def json_or_text(response: requests.Response) -> Any:
+    try:
+        return response.json()
+    except Exception:
+        return response.text[:300]
+
+
+def extract_code(data: Any) -> str:
+    """从 YYB 服务多层响应结构中提取 code"""
+    if not isinstance(data, dict):
+        return ""
+    direct = data.get("code") or data.get("wx_code")
+    if direct not in (None, "", 0):
+        return str(direct)
+    nested = data.get("Data") or data.get("data") or {}
+    if isinstance(nested, dict):
+        nested_code = nested.get("code") or nested.get("wx_code")
+        if nested_code not in (None, "", 0):
+            return str(nested_code)
+        result = nested.get("result") or {}
+        if isinstance(result, dict):
+            result_code = result.get("code") or result.get("wx_code")
+            if result_code not in (None, "", 0):
+                return str(result_code)
+    return ""
+
+
+def extract_accounts_payload(data: Any) -> List[Any]:
+    """从 YYB /accounts 响应中提取账号列表（支持多层嵌套）"""
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    for key in ("accounts", "data", "list", "rows", "result"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            nested = extract_accounts_payload(value)
+            if nested:
+                return nested
+    return []
+
+
+def extract_ref(item: Any) -> str:
+    """从账号项中提取 ref 字段"""
+    if isinstance(item, str):
+        return item.strip()
+    if not isinstance(item, dict):
+        return ""
+    for key in ("ref", "openid", "openId", "wxid", "wx_id", "id", "account"):
+        value = item.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+
+def extract_label(item: Any, fallback: str) -> str:
+    """从账号项中提取显示名（remark > name > nickname > ... > fallback）"""
+    if not isinstance(item, dict):
+        return fallback
+    for key in ("remark", "name", "nickname", "nickName", "label", "wxid", "openid", "ref"):
+        value = item.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return fallback
+
+
+@dataclass
+class CodeAccount:
+    label: str   # 显示名称
+    ref: str     # 账号标识，提交给 /wxapp/getCode
+
+
+class YybCodeProvider:
+    def __init__(self, server: str):
+        self.server = (server or "").strip().rstrip("/")
+        self.session = requests.Session()
+        self.session.verify = False
+
+    def list_accounts(self) -> List[CodeAccount]:
+        # 优先用手动配置的 YYB_REFS
+        refs = [str(x).strip() for x in YYB_REFS if str(x).strip()]
+        if refs:
+            return [CodeAccount(x, x) for x in refs]
+
+        # 自动从 /accounts 获取
+        if not self.server:
+            print("未配置 YYB 服务地址，且 YYB_REFS 为空")
+            return []
+
+        url = f"{self.server}/accounts"
+        try:
+            response = self.session.get(url, timeout=YYB_TIMEOUT)
+            data = json_or_text(response)
+            items = extract_accounts_payload(data)
+        except Exception as exc:
+            print(f"读取 YYB /accounts 异常：{str(exc)[:120]}")
+            return []
+
+        accounts: List[CodeAccount] = []
+        seen = set()
+        for item in items:
+            ref = extract_ref(item)
+            if not ref or ref in seen:
+                continue
+            seen.add(ref)
+            accounts.append(CodeAccount(extract_label(item, ref), ref))
+
+        print(f"YYB /accounts 解析到 {len(accounts)} 个账号")
+        return accounts
+
+    def get_code(self, account: CodeAccount) -> Optional[str]:
+        """POST /wxapp/getCode 获取微信 code，指数退避重试"""
+        if not self.server:
+            print("未配置 YYB 服务地址，无法请求 /wxapp/getCode")
+            return None
+
+        url = f"{self.server}/wxapp/getCode"
+        payload = {"app_id": APP_NO, "ref": account.ref}
+        headers = {"Content-Type": "application/json", "Accept": "application/json",
+                   "User-Agent": "okhttp/3.12.13"}
+        api_key = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
+        if api_key:
+            headers["Authorization"] = api_key if " " in api_key else "Bearer " + api_key
+
+        for attempt in range(1, CODE_RETRY_TIMES + 1):
+            try:
+                response = self.session.post(
+                    url, json=payload, headers=headers, timeout=YYB_TIMEOUT
+                )
+                data = json_or_text(response)
+                code = extract_code(data)
+                if code and len(code) >= 16:
+                    return code
+                print(f"{account.label} 获取 code 为空 resp={str(data)[:160]}")
+            except Exception as exc:
+                print(f"{account.label} 获取 code 异常：{str(exc)[:120]}")
+
+            if attempt < CODE_RETRY_TIMES:
+                time.sleep(RETRY_BASE_DELAY * attempt)
+
+        return None
+# =================================================
+
+
+# --------------------------------------------------------------------------- #
 # YYB 调用
 # --------------------------------------------------------------------------- #
 def yyb_post(account: AccountTarget, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -302,7 +462,14 @@ def yyb_post(account: AccountTarget, path: str, payload: Dict[str, Any]) -> Dict
 
 
 def yyb_get_wx_code(account: AccountTarget) -> str:
-    """取 wx.login code（一次性，拿到后要尽快用于登录）。"""
+    """取 wx.login code（一次性，拿到后要尽快用于登录）。provider 可用时走 provider。"""
+    context = _PROVIDER_CONTEXT.get(account.ref)
+    if context is not None:
+        provider, code_account = context
+        code = provider.get_code(code_account)
+        if code:
+            return code
+        raise RuntimeError("YYB 未返回有效 code（provider 重试耗尽）")
     body = yyb_post(account, "/wxapp/getCode", {"ref": account.ref, "app_id": APP_NO})
     data = body.get("data") or {}
     result = data.get("result") if isinstance(data.get("result"), dict) else {}
@@ -310,6 +477,10 @@ def yyb_get_wx_code(account: AccountTarget) -> str:
         if isinstance(candidate, str) and len(candidate) >= 16:
             return candidate
     raise RuntimeError(f"YYB 未返回有效 code：{preview(body, 200)}")
+
+
+# provider 上下文：main 收集账号时注册
+_PROVIDER_CONTEXT: Dict[str, Tuple[YybCodeProvider, CodeAccount]] = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -896,11 +1067,24 @@ def main() -> int:
         f"🔐 登录    : YYB 自动取码 → 小程序 login → wmhsso → H5（无需抓包）",
     ])
 
+    # Step 1: 先收集账号（WECHAT_SERVER /accounts 优先，YYB_SERVER 地址@ref 行兼容回退）
+    accounts: List[AccountTarget] = []
+    _PROVIDER_CONTEXT.clear()
     try:
-        accounts = load_accounts()
-    except Exception as exc:                               # noqa: BLE001
-        print(f"❌ {exc}")
-        return 1
+        for server in SERVERS:
+            provider = YybCodeProvider(server)
+            for item in provider.list_accounts():
+                target = AccountTarget(endpoint=provider.server, ref=item.ref, index=len(accounts) + 1)
+                _PROVIDER_CONTEXT[item.ref] = (provider, item)
+                accounts.append(target)
+    except Exception:
+        pass
+    if not accounts:
+        try:
+            accounts = load_accounts()
+        except Exception as exc:                           # noqa: BLE001
+            print(f"❌ {exc}")
+            return 1
 
     results: List[Dict[str, Any]] = []
     for idx, account in enumerate(accounts, 1):
