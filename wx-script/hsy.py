@@ -49,14 +49,22 @@ def key(*codes):
 
 
 def routes():
-    """兼容旧 YYB_SERVER（每行 地址@ref）；返回 [(server, ref), ...]。"""
+    """兼容旧 YYB_SERVER；返回 [(server, ref), ...]。
+
+    支持 地址@ref 行；纯服务地址行自动 GET /accounts 发现全部账号
+    （服务不可达时降级跳过该行）。
+    """
     values = []
+    bare_servers = []
     for lineno, raw in enumerate(os.getenv("YYB_SERVER", "").splitlines(), 1):
         raw = raw.strip()
         if not raw:
             continue
         if "@" not in raw:
-            raise RuntimeError(f"YYB_SERVER 第 {lineno} 行格式错误，应为 地址@账号标识")
+            server = normalize_server(raw)
+            if server:
+                bare_servers.append(server)
+            continue
         server, ref = raw.rsplit("@", 1)
         server, ref = server.strip().rstrip("/"), ref.strip()
         if not server or not ref:
@@ -64,6 +72,12 @@ def routes():
         if not server.startswith(("http://", "https://")):
             server = "http://" + server
         values.append((server, ref))
+    for server in dict.fromkeys(bare_servers):
+        provider = YybCodeProvider(server)
+        for account in provider.list_accounts():
+            values.append((server, account.ref))
+        if not any(s == server for s, _ in values):
+            print(f"⚠️ {server} /accounts 未解析到账号（请确认 YYB 服务在线且已授权）")
     return values
 
 

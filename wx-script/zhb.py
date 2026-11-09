@@ -274,24 +274,34 @@ def normalize_endpoint(value: str) -> str:
 def load_accounts() -> List[AccountTarget]:
     raw = os.getenv("YYB_SERVER", "").strip()
     accounts: List[AccountTarget] = []
+    bare_servers: List[str] = []
     if raw:
         for line in raw.splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             if "@" not in line:
-                print(f"⚠️ [配置] 忽略无账号标识的行：{line}")
+                # 纯服务地址行：记录后走 /accounts 自动发现
+                bare_servers.append(line)
                 continue
             endpoint, ref = (part.strip() for part in line.rsplit("@", 1))
             if not endpoint or not ref:
                 print(f"⚠️ [配置] 忽略不完整行：{line}")
                 continue
             accounts.append(AccountTarget(endpoint=endpoint, ref=ref, index=len(accounts) + 1))
+    for server in dict.fromkeys(bare_servers):
+        provider = YybCodeProvider(server)
+        found = provider.list_accounts()
+        if not found:
+            print(f"⚠️ [配置] {provider.server} /accounts 未解析到账号（请确认 YYB 服务在线且已授权）")
+            continue
+        for item in found:
+            accounts.append(AccountTarget(endpoint=provider.server, ref=item.ref, index=len(accounts) + 1))
     if not accounts:
         raise RuntimeError(
-            "未读取到有效账号。请配置环境变量 YYB_SERVER，每行一个账号，格式：\n"
-            "  YYB地址@账号ID      例：yyb-go:8000@1\n"
-            "  多账号就是多行（第 2 个账号写 @2，以此类推）"
+            "未读取到有效账号。请配置环境变量 YYB_SERVER，支持两种格式：\n"
+            "  YYB地址@账号ID      例：yyb-go:8000@1（多账号多行）\n"
+            "  只填服务地址        例：yyb-go:8000（自动发现全部账号）"
         )
     return accounts
 

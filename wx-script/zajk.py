@@ -763,10 +763,20 @@ def main() -> int:
             line = line.strip()
             if not line:
                 continue
-            if "@" in line:
+            if "@" in line and not line.endswith("@"):
                 host, ref = line.rsplit("@", 1)
             else:
-                host, ref = line, "1"
+                # 纯服务地址：GET /accounts 自动发现账号
+                normalized = normalize_server(line)
+                if not normalized:
+                    continue
+                provider = providers.setdefault(normalized, YybCodeProvider(normalized))
+                found = provider.list_accounts()
+                if not found:
+                    log(f"⚠️ {normalized} /accounts 未解析到账号（请确认 YYB 服务在线且已授权）")
+                for account in found:
+                    all_accounts.append((account, provider))
+                continue
             if not host or not ref:
                 continue
             normalized = normalize_server(host)

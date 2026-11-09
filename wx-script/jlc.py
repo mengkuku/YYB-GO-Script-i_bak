@@ -276,11 +276,18 @@ def mask_token(token):
 
 # ===================== 登录相关 =====================
 def _yyb_entries() -> List[Tuple[str, str]]:
-    """解析 YYB_SERVER，每行格式为 server:port@ref。"""
+    """解析 YYB_SERVER；返回 [(server, ref), ...]。
+
+    支持 server:port@ref 行；纯服务地址行自动 GET /accounts 发现全部账号
+    （服务不可达时降级跳过该行）。
+    """
     entries: List[Tuple[str, str]] = []
+    bare_servers: List[str] = []
     for line in os.getenv("YYB_SERVER", "").splitlines():
         value = line.strip()
         if not value or "@" not in value:
+            if value:
+                bare_servers.append(value)
             continue
         server, ref = value.rsplit("@", 1)
         server, ref = server.strip().rstrip("/"), ref.strip()
@@ -289,6 +296,10 @@ def _yyb_entries() -> List[Tuple[str, str]]:
         if not server.startswith(("http://", "https://")):
             server = "http://" + server
         entries.append((server, ref))
+    for server in dict.fromkeys(bare_servers):
+        provider = YybCodeProvider(server, JLC_MINI_APPID)
+        for account in provider.list_accounts():
+            entries.append((provider.server, account.ref))
     return entries
 
 

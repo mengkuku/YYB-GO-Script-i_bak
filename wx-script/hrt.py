@@ -317,7 +317,10 @@ def parse_accounts() -> List[Account]:
 
 
 def load_all_accounts() -> List[Tuple[CodeAccount, YybCodeProvider]]:
-    """先收集账号：WECHAT_SERVER /accounts 优先，YYB_SERVER 地址@ref 行兼容回退。"""
+    """先收集账号：WECHAT_SERVER /accounts 优先，YYB_SERVER 兼容回退。
+
+    YYB_SERVER 支持 地址@ref 行；纯服务地址行自动 GET /accounts 发现全部账号。
+    """
     all_accounts: List[Tuple[CodeAccount, YybCodeProvider]] = []
     for server in SERVERS:
         provider = YybCodeProvider(server)
@@ -325,10 +328,28 @@ def load_all_accounts() -> List[Tuple[CodeAccount, YybCodeProvider]]:
             all_accounts.append((account, provider))
     if not all_accounts:
         providers: Dict[str, YybCodeProvider] = {}
+        legacy_refs: Dict[str, int] = {}
         for legacy in parse_accounts():
-            normalized = normalize_server(legacy.server)
-            provider = providers.setdefault(normalized, YybCodeProvider(normalized))
-            all_accounts.append((CodeAccount(label=legacy.ref, ref=legacy.ref), provider))
+            legacy_refs[legacy.ref] = legacy.index
+        for line in os.getenv("YYB_SERVER", "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "@" in line:
+                server, ref = line.rsplit("@", 1)
+                server, ref = normalize_server(server), ref.strip()
+                if not server or not ref or ref in legacy_refs:
+                    continue
+            else:
+                server, ref = normalize_server(line), ""
+            if not server or server in providers:
+                continue
+            provider = providers.setdefault(server, YybCodeProvider(server))
+            if ref:
+                all_accounts.append((CodeAccount(label=ref, ref=ref), provider))
+            else:
+                for account in provider.list_accounts():
+                    all_accounts.append((account, provider))
     return all_accounts
 
 

@@ -498,7 +498,10 @@ def parse_yyb_go_entry(raw_value):
 
 
 def load_legacy_accounts() -> List[Tuple[CodeAccount, YybCodeProvider]]:
-    """从旧版 YYB_SERVER（每行 地址@ref）构建账号列表，兼容存量青龙配置。"""
+    """从旧版 YYB_SERVER 构建账号列表；支持 地址@ref 行与纯服务地址行。
+
+    纯服务地址行：GET /accounts 自动发现全部账号（服务不可达时降级跳过）。
+    """
     pairs: List[Tuple[CodeAccount, YybCodeProvider]] = []
     providers: Dict[str, YybCodeProvider] = {}
     for line in os.getenv("YYB_SERVER", "").splitlines():
@@ -506,10 +509,15 @@ def load_legacy_accounts() -> List[Tuple[CodeAccount, YybCodeProvider]]:
         if not line:
             continue
         server, ref = parse_yyb_go_entry(line)
-        if not server or not ref:
+        if not server:
             continue
         provider = providers.setdefault(server, YybCodeProvider(server))
-        pairs.append((CodeAccount(label=ref, ref=ref), provider))
+        if ref:
+            pairs.append((CodeAccount(label=ref, ref=ref), provider))
+            continue
+        # 纯服务地址：自动从 /accounts 发现账号
+        for account in provider.list_accounts():
+            pairs.append((account, provider))
     return pairs
 
 def common_headers(token: str | None = None) -> Dict[str, str]:

@@ -451,6 +451,17 @@ def main():
             try:
                 server, ref = parse_entry(line)
             except TaskError:
+                # 纯服务地址行：GET /accounts 自动发现账号
+                server = line.rstrip("/")
+                if not server.startswith(("http://", "https://")):
+                    server = "http://" + server
+                provider = providers.setdefault(server, YybCodeProvider(server))
+                found = provider.list_accounts()
+                if not found:
+                    print(f"⚠️ {server} /accounts 未解析到账号（请确认 YYB 服务在线且已授权）")
+                    continue
+                for account in found:
+                    all_accounts.append((account, provider))
                 continue
             provider = providers.setdefault(server, YybCodeProvider(server))
             all_accounts.append((CodeAccount(label=ref, ref=ref), provider))

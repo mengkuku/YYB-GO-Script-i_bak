@@ -346,7 +346,7 @@ class AutoTask:
     def check_env(self):
         """
         检查环境变量
-        :return: 环境变量字符串
+        :return: 环境变量字符串（含纯服务地址行，由调用方走 /accounts 自动发现）
         """
         try:
             yyb_server = os.getenv("YYB_SERVER", "").strip()
@@ -361,7 +361,11 @@ class AutoTask:
                     self.wechat_code_adapter.parse_entry(entry)
                     yield entry
                 except ValueError as exc:
-                    self.log(f"[检查环境变量] 跳过无效配置 {entry!r}: {exc}", level="error")
+                    # 纯服务地址（无 @ref）放行，调用方自动发现账号；其余格式无效跳过
+                    if "@" in entry or not entry.rstrip("/").replace("://", "").replace(".", "").replace(":", ""):
+                        self.log(f"[检查环境变量] 跳过无效配置 {entry!r}: {exc}", level="error")
+                        continue
+                    yield entry
         except Exception as e:
             self.log(f"[检查环境变量] 发生错误: {str(e)}\n{traceback.format_exc()}", level="error")
             raise
@@ -531,6 +535,17 @@ class AutoTask:
                     try:
                         server, ref = self.wechat_code_adapter.parse_entry(entry)
                     except ValueError:
+                        # 纯服务地址行：GET /accounts 自动发现账号
+                        normalized = normalize_server(entry)
+                        if not normalized:
+                            continue
+                        provider = providers.setdefault(normalized, YybCodeProvider(normalized, self.wx_appid))
+                        found = provider.list_accounts()
+                        if not found:
+                            self.log(f"{normalized} /accounts 未解析到账号（请确认 YYB 服务在线且已授权）", level="warning")
+                            continue
+                        for account in found:
+                            all_accounts.append((account, provider))
                         continue
                     normalized = normalize_server(server)
                     provider = providers.setdefault(normalized, YybCodeProvider(normalized, self.wx_appid))

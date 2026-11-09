@@ -41,13 +41,19 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # ===== YYB-Go-Enhanced + QingLong standalone adapter =====
 def _yyb_routes():
+    """解析 YYB_SERVER；支持 地址@ref 行与纯服务地址行（/accounts 自动发现）。"""
     routes = []
+    bare_servers = []
     for number, line in enumerate(os.getenv("YYB_SERVER", "").splitlines(), 1):
         line = line.strip()
         if not line:
             continue
         if "@" not in line:
-            raise RuntimeError(f"YYB_SERVER 第 {number} 行格式错误，应为 地址@账号标识")
+            server = line.strip().rstrip("/")
+            if not server.lower().startswith(("http://", "https://")):
+                server = "http://" + server
+            bare_servers.append(server)
+            continue
         server, ref = line.rsplit("@", 1)
         if not server.strip() or not ref.strip():
             raise RuntimeError(f"YYB_SERVER 第 {number} 行格式错误，应为 地址@账号标识")
@@ -55,8 +61,47 @@ def _yyb_routes():
         if not server.lower().startswith(("http://", "https://")):
             server = "http://" + server
         routes.append({"server": server, "ref": ref.strip()})
+    # 纯服务地址行：GET /accounts 自动发现账号（失败降级，不抛异常）
+    for server in dict.fromkeys(bare_servers):
+        try:
+            import requests as _requests
+            response = _requests.get(server + "/accounts", timeout=15)
+            data = response.json()
+            items = data if isinstance(data, list) else None
+            if items is None and isinstance(data, dict):
+                for key in ("data", "list", "rows", "result", "accounts"):
+                    value = data.get(key)
+                    if isinstance(value, list) and value:
+                        items = value
+                        break
+                    if isinstance(value, dict):
+                        nested = value
+                        if nested and isinstance(nested, dict):
+                            for k2 in ("list", "rows", "data", "result", "accounts"):
+                                v2 = nested.get(k2)
+                                if isinstance(v2, list) and v2:
+                                    items = v2
+                                    break
+                        if items:
+                            break
+                if items is None and isinstance(data, dict):
+                    items = list(data.values())
+            if items:
+                for item in items:
+                    ref = ""
+                    if isinstance(item, str):
+                        ref = item.strip()
+                    elif isinstance(item, dict):
+                        for key in ("ref", "openid", "openId", "wxid", "wx_id", "id", "account"):
+                            if item.get(key) not in (None, ""):
+                                ref = str(item[key]).strip()
+                                break
+                    if ref:
+                        routes.append({"server": server, "ref": ref})
+        except Exception as exc:
+            print(f"⚠️ {server} /accounts 未解析到账号（{type(exc).__name__}），请确认 YYB 服务在线且已授权")
     if not routes:
-        raise RuntimeError("未配置 YYB_SERVER（每行：地址@账号标识）")
+        raise RuntimeError("未配置 YYB_SERVER（每行：地址@账号标识，或只填服务地址自动发现账号）")
     return routes
 
 
@@ -734,6 +779,22 @@ def main():
             provider = providers.setdefault(server, YybCodeProvider(server))
             remark = parts[1].strip() if len(parts) > 1 else openid
             all_accounts.append((CodeAccount(label=remark, ref=openid), provider))
+        # 只填地址（无 @ref）的行：自动从 /accounts 发现账号
+        if not all_accounts:
+            for line in (os.getenv("YYB_SERVER", "") or "").splitlines():
+                line = line.strip()
+                if not line or "@" in line:
+                    continue
+                server = normalize_server(line)
+                if not server:
+                    continue
+                provider = providers.setdefault(server, YybCodeProvider(server))
+                found = provider.list_accounts()
+                if not found:
+                    print(f"⚠️ {server} /accounts 未解析到账号（请确认 YYB 服务在线且已授权）")
+                    continue
+                for account in found:
+                    all_accounts.append((account, provider))
 
     if not all_accounts:
         print("❌ 未从 yyb_go 获取到存活账号(可配置环境变量 lqpj 指定白名单), 退出。")

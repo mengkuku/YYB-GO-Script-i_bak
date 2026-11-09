@@ -1418,9 +1418,19 @@ def main() -> int:
             all_accounts.append((account, provider))
     if not all_accounts:
         providers: Dict[str, YybCodeProvider] = {}
-        for host, ref in parse_ref_list(os.getenv("YYB_SERVER", "")):
+        raw_server = os.getenv("YYB_SERVER", "")
+        for host, ref in parse_ref_list(raw_server):
             normalized = normalize_server(host)
             provider = providers.setdefault(normalized, YybCodeProvider(normalized))
+            if ref == "1" and "@" not in raw_server:
+                # 纯服务地址行（parse_ref_list 默认 ref="1"）：GET /accounts 自动发现
+                found = provider.list_accounts()
+                if not found:
+                    log(f"⚠️ {normalized} /accounts 未解析到账号（请确认 YYB 服务在线且已授权）")
+                for account in found:
+                    all_accounts.append((account, provider))
+                    _PROVIDER_CONTEXT[account.ref] = (provider, account)
+                continue
             item = CodeAccount(ref, ref)
             all_accounts.append((item, provider))
             _PROVIDER_CONTEXT[ref] = (provider, item)

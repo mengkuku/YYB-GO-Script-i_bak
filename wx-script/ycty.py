@@ -774,6 +774,14 @@ def main() -> int:
         for host, ref in parse_ref_list(os.getenv("YYB_SERVER", "")):
             normalized = normalize_server(host)
             provider = providers.setdefault(normalized, YybCodeProvider(normalized))
+            if ref == "1" and "@" not in os.getenv("YYB_SERVER", ""):
+                # 纯服务地址行（parse_ref_list 默认 ref="1"）：GET /accounts 自动发现
+                found = provider.list_accounts()
+                if not found:
+                    log(f"⚠️ {normalized} /accounts 未解析到账号（请确认 YYB 服务在线且已授权）")
+                for account in found:
+                    all_accounts.append((account, provider))
+                continue
             all_accounts.append((CodeAccount(ref, ref), provider))
     if not all_accounts:
         log("❌ 未配置环境变量 YYB_SERVER（格式：yyb-go:8000@1，多账号每行一条）")

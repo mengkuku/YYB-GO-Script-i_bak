@@ -573,6 +573,22 @@ class FliggyTask:
                 normalized = normalize_server(server)
                 provider = providers.setdefault(normalized, YybCodeProvider(normalized))
                 all_accounts.append((CodeAccount(label=ref, ref=ref), provider))
+            # 只填地址（无 @ref）的行：自动从 /accounts 发现账号
+            if not all_accounts:
+                for line in (os.getenv("YYB_SERVER", "") or "").splitlines():
+                    line = line.strip()
+                    if not line or "@" in line:
+                        continue
+                    normalized = normalize_server(line)
+                    if not normalized:
+                        continue
+                    provider = providers.setdefault(normalized, YybCodeProvider(normalized))
+                    found = provider.list_accounts()
+                    if not found:
+                        self.log(f"⚠️ {normalized} /accounts 未解析到账号（请确认 YYB 服务在线且已授权）")
+                        continue
+                    for account in found:
+                        all_accounts.append((account, provider))
         if not all_accounts:
             self.failed_count = 1
         # Step 2: 执行任务

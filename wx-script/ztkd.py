@@ -274,7 +274,7 @@ class AutoTask:
 
 
     def check_env(self):
-        """解析旧版 YYB_SERVER（每行 地址@ref），返回 [(server, ref), ...]；兼容保留。"""
+        """解析旧版 YYB_SERVER；返回 [(server, ref), ...]，ref 为空表示纯服务地址行。"""
         try:
             yyb_server = os.getenv("YYB_SERVER", "")
             if not yyb_server.strip():
@@ -286,7 +286,11 @@ class AutoTask:
                 if not raw:
                     continue
                 if "@" not in raw:
-                    self.log(f"[检查环境变量]YYB_SERVER 第{line_no}行格式错误，已跳过", level="error")
+                    # 纯服务地址：返回 (server, "") 由调用方走 /accounts 自动发现
+                    server = raw.rstrip("/")
+                    if not server.startswith(("http://", "https://")):
+                        server = f"http://{server}"
+                    yield server, ""
                     continue
                 server, ref = raw.rsplit("@", 1)
                 if not server.strip() or not ref.strip():
@@ -458,7 +462,15 @@ class AutoTask:
                 for server, ref in self.check_env():
                     normalized = normalize_server(server)
                     provider = providers.setdefault(normalized, YybCodeProvider(normalized, self.wx_appid))
-                    all_accounts.append((CodeAccount(label=ref, ref=ref), provider))
+                    if ref:
+                        all_accounts.append((CodeAccount(label=ref, ref=ref), provider))
+                        continue
+                    # 纯服务地址：GET /accounts 自动发现账号
+                    found = provider.list_accounts()
+                    if not found:
+                        self.log(f"[检查环境变量]{normalized} /accounts 未解析到账号（请确认 YYB 服务在线且已授权）", level="warning")
+                    for account in found:
+                        all_accounts.append((account, provider))
 
             # Step 2: 执行任务
             for index, (account, provider) in enumerate(all_accounts, 1):
