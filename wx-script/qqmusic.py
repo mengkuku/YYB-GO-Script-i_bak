@@ -101,14 +101,18 @@ ACCOUNT_SERVERS: Dict[str, str] = {}
 
 
 def load_accounts() -> List[str]:
-    """解析多行 YYB_SERVER=服务地址@账号ref，并应用可选 WX_ID 白名单。"""
+    """解析 YYB_SERVER，并应用可选 WX_ID 白名单。
+
+    支持 地址@ref 行；纯服务地址行自动 GET /accounts 发现全部账号。
+    """
     refs: List[str] = []
+    bare_servers: List[str] = []
     for line_no, raw in enumerate(os.getenv("YYB_SERVER", "").splitlines(), 1):
         item = raw.strip()
         if not item:
             continue
         if "@" not in item:
-            print(f"❌ YYB_SERVER 第 {line_no} 行缺少 @，已跳过")
+            bare_servers.append(item)
             continue
         server, ref = item.rsplit("@", 1)
         server, ref = server.strip().rstrip("/"), ref.strip()
@@ -121,6 +125,18 @@ def load_accounts() -> List[str]:
             ACCOUNT_SERVERS[ref] = server
             ACCOUNT_NAMES[ref] = f"账号{len(refs) + 1}"
             refs.append(ref)
+
+    # 纯服务地址行：GET /accounts 自动发现账号
+    for server in dict.fromkeys(bare_servers):
+        provider = YybCodeProvider(server)
+        found = provider.list_accounts()
+        if not found:
+            print(f"⚠️ {provider.server} /accounts 未解析到账号（请确认 YYB 服务在线且已授权）")
+            continue
+        for account in found:
+            # provider.list_accounts 已写 ACCOUNT_SERVERS；这里只补 refs 列表
+            if account.ref not in refs:
+                refs.append(account.ref)
 
     raw_filter = os.getenv("WX_ID", "").strip()
     if raw_filter:

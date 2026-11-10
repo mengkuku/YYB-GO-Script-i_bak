@@ -72,13 +72,19 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # ===== YYB-Go-Enhanced + QingLong standalone adapter =====
 def _yyb_routes():
+    """解析 YYB_SERVER；支持 地址@ref 行与纯服务地址行（/accounts 自动发现）。"""
     routes = []
+    bare_servers = []
     for number, line in enumerate(os.getenv("YYB_SERVER", "").splitlines(), 1):
         line = line.strip()
         if not line:
             continue
         if "@" not in line:
-            raise RuntimeError(f"YYB_SERVER 第 {number} 行格式错误，应为 地址@账号标识")
+            server = line.strip().rstrip("/")
+            if not server.lower().startswith(("http://", "https://")):
+                server = "http://" + server
+            bare_servers.append(server)
+            continue
         server, ref = line.rsplit("@", 1)
         if not server.strip() or not ref.strip():
             raise RuntimeError(f"YYB_SERVER 第 {number} 行格式错误，应为 地址@账号标识")
@@ -86,8 +92,44 @@ def _yyb_routes():
         if not server.lower().startswith(("http://", "https://")):
             server = "http://" + server
         routes.append({"server": server, "ref": ref.strip()})
+    # 纯服务地址行：GET /accounts 自动发现账号（失败降级，不抛异常）
+    for server in dict.fromkeys(bare_servers):
+        try:
+            response = requests.get(server + "/accounts", timeout=15)
+            data = response.json()
+            items = data if isinstance(data, list) else None
+            if items is None and isinstance(data, dict):
+                for key in ("data", "list", "rows", "result", "accounts"):
+                    value = data.get(key)
+                    if isinstance(value, list) and value:
+                        items = value
+                        break
+                    if isinstance(value, dict):
+                        for k2 in ("list", "rows", "data", "result", "accounts"):
+                            v2 = value.get(k2)
+                            if isinstance(v2, list) and v2:
+                                items = v2
+                                break
+                        if items:
+                            break
+                if items is None:
+                    items = list(data.values())
+            if items:
+                for item in items:
+                    ref = ""
+                    if isinstance(item, str):
+                        ref = item.strip()
+                    elif isinstance(item, dict):
+                        for key in ("ref", "openid", "openId", "wxid", "wx_id", "id", "account"):
+                            if item.get(key) not in (None, ""):
+                                ref = str(item[key]).strip()
+                                break
+                    if ref:
+                        routes.append({"server": server, "ref": ref})
+        except Exception as exc:
+            print(f"⚠️ {server} /accounts 未解析到账号（{type(exc).__name__}），请确认 YYB 服务在线且已授权")
     if not routes:
-        raise RuntimeError("未配置 YYB_SERVER（每行：地址@账号标识）")
+        raise RuntimeError("未配置 YYB_SERVER（每行：地址@账号标识，或只填服务地址自动发现账号）")
     return routes
 
 
