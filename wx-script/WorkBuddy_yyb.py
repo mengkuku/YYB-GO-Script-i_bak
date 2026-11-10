@@ -448,16 +448,71 @@ class Account:
         return hashlib.sha256((self.server + "\0" + self.ref).encode()).hexdigest()
 
 
+def _discovered_account_refs(server):
+    """GET {server}/accounts 自动发现账号 ref（多层嵌套兼容）；失败返回空列表。"""
+    session = requests.Session()
+    session.trust_env = False
+    session.verify = False
+    try:
+        payload = session.get(server + "/accounts", timeout=15).json()
+    except Exception:
+        return []
+    finally:
+        session.close()
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        items = []
+        for key in ("accounts", "data", "list", "rows", "result"):
+            value = payload.get(key)
+            if isinstance(value, list) and value:
+                items = value
+                break
+            if isinstance(value, dict):
+                nested = [v for v in value.values() if isinstance(v, (list, dict))]
+                if nested:
+                    items = nested[0] if isinstance(nested[0], list) else (
+                        [nested[0]] if isinstance(nested[0], dict) else [])
+                    break
+    else:
+        items = []
+    refs = []
+    for item in items:
+        if isinstance(item, str) and item.strip():
+            refs.append(item.strip())
+        elif isinstance(item, dict):
+            for key in ("ref", "openid", "openId", "wxid", "wx_id", "id", "account"):
+                value = item.get(key)
+                if value not in (None, ""):
+                    refs.append(str(value).strip())
+                    break
+    return [ref for ref in refs if ref]
+
+
 def accounts_from_env(value):
     accounts = []
     seen = set()
+    bare_servers = []
+    lineno = 0
     for line in value.splitlines():
         line = line.split("#", 1)[0].strip()
         if not line:
             continue
-        number = len(accounts) + 1
+        lineno += 1
         if "@" not in line:
-            raise SafeError(f"第{number}条 YYB 配置格式错误")
+            # 纯服务地址行：记下地址，稍后 GET /accounts 自动发现账号
+            server = line if "://" in line else "http://" + line
+            parsed = urlsplit(server)
+            if (parsed.scheme not in ("http", "https") or not parsed.hostname or
+                    parsed.username or parsed.password or parsed.query or parsed.fragment):
+                raise SafeError(f"第{lineno}条 YYB 配置格式错误")
+            try:
+                parsed.port
+            except ValueError:
+                raise SafeError(f"第{lineno}条 YYB 端口错误") from None
+            bare_servers.append(server.rstrip("/"))
+            continue
+        number = len(accounts) + 1
         server, ref = (part.strip() for part in line.rsplit("@", 1))
         if "://" not in server:
             server = "http://" + server
@@ -475,6 +530,19 @@ def accounts_from_env(value):
             raise SafeError(f"第{number}条 YYB 配置重复，请移除重复条目")
         seen.add(account.key)
         accounts.append(account)
+    # 纯服务地址行自动发现；显式行优先，重复 ref 去重，失败降级不影响显式行
+    for server in dict.fromkeys(bare_servers):
+        fresh = 0
+        for ref in _discovered_account_refs(server):
+            account = Account(len(accounts) + 1, server, ref)
+            if account.key in seen:
+                continue
+            seen.add(account.key)
+            accounts.append(account)
+            fresh += 1
+        if not fresh:
+            print("⚠️ %s /accounts 未发现账号（请确认 YYB 服务在线且已授权），跳过该行" % server,
+                  flush=True)
     if not accounts:
         raise SafeError("没有可用的 YYB_SERVER 配置")
     return accounts
