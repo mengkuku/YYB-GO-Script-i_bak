@@ -264,9 +264,17 @@ class WxAdapter:
 
     def _configured_yyb_entries(self):
         entries = []
+        bare_servers = []
         for line in (os.environ.get("YYB_SERVER") or "").splitlines():
             value = line.strip()
-            if not value or "@" not in value:
+            if not value:
+                continue
+            if "@" not in value:
+                server = value.rstrip('/')
+                if not server.startswith(("http://", "https://")):
+                    server = "http://" + server
+                if server:
+                    bare_servers.append(server)
                 continue
             server, ref = value.rsplit("@", 1)
             server, ref = server.strip().rstrip("/"), self._raw_id(ref)
@@ -275,6 +283,43 @@ class WxAdapter:
             if not server.startswith(("http://", "https://")):
                 server = "http://" + server
             entries.append({"server": server, "ref": ref})
+        # 纯服务地址行：从 /accounts 自动发现账号（失败降级）
+        for server in dict.fromkeys(bare_servers):
+            try:
+                resp = self.session.get(server + "/accounts", timeout=15)
+                body = resp.json()
+                items = body if isinstance(body, list) else None
+                if items is None and isinstance(body, dict):
+                    for key in ("data", "list", "rows", "result", "accounts"):
+                        value = body.get(key)
+                        if isinstance(value, list) and value:
+                            items = value
+                            break
+                        if isinstance(value, dict):
+                            for k2 in ("list", "rows", "data", "result", "accounts"):
+                                v2 = value.get(k2)
+                                if isinstance(v2, list) and v2:
+                                    items = v2
+                                    break
+                            if items:
+                                break
+                    if items is None:
+                        items = list(body.values())
+                if not isinstance(items, list):
+                    items = []
+                for item in items:
+                    ref = ""
+                    if isinstance(item, str):
+                        ref = item.strip()
+                    elif isinstance(item, dict):
+                        for key in ("ref", "openid", "openId", "wxid", "wx_id", "id", "account"):
+                            if item.get(key) not in (None, ""):
+                                ref = str(item[key]).strip()
+                                break
+                    if ref:
+                        entries.append({"server": server, "ref": ref})
+            except Exception as e:
+                log.warning(f"读取 {server}/accounts 失败，请确认 YYB 服务在线且已授权: {type(e).__name__}")
         return entries
 
     def _yyb_entry_for(self, wxid):
@@ -1002,12 +1047,24 @@ def parse_accounts(raw):
     return accounts
 
 def parse_yyb_server_accounts(raw):
-    """从多行 YYB_SERVER（地址@ref）提取账号，保持原有顺序并去重。"""
+    """从 YYB_SERVER 提取账号，保持原有顺序并去重。
+
+    支持 地址@ref 行；纯服务地址行自动 GET /accounts 发现全部账号
+    （服务不可达时降级跳过该行）。
+    """
     accounts = []
     seen = set()
+    bare_servers = []
     for line in (raw or "").splitlines():
         value = line.strip()
-        if not value or "@" not in value:
+        if not value:
+            continue
+        if "@" not in value:
+            server = value.rstrip('/')
+            if not server.startswith(('http://', 'https://')):
+                server = 'http://' + server
+            if server:
+                bare_servers.append(server)
             continue
         server, ref = value.rsplit("@", 1)
         ref, _, note = ref.strip().partition('#')
@@ -1019,6 +1076,51 @@ def parse_yyb_server_accounts(raw):
             continue
         seen.add(identity)
         accounts.append({"id": identity, "ref": ref, "note": note})
+    # 纯服务地址行：从 /accounts 自动发现账号
+    for server in dict.fromkeys(bare_servers):
+        try:
+            resp = requests.get(server + "/accounts", timeout=15)
+            body = resp.json()
+            items = body if isinstance(body, list) else None
+            if items is None and isinstance(body, dict):
+                for key in ("data", "list", "rows", "result", "accounts"):
+                    value = body.get(key)
+                    if isinstance(value, list) and value:
+                        items = value
+                        break
+                    if isinstance(value, dict):
+                        for k2 in ("list", "rows", "data", "result", "accounts"):
+                            v2 = value.get(k2)
+                            if isinstance(v2, list) and v2:
+                                items = v2
+                                break
+                        if items:
+                            break
+                if items is None:
+                    items = list(body.values())
+            if not isinstance(items, list):
+                items = []
+            refs = []
+            for item in items:
+                ref = ""
+                if isinstance(item, str):
+                    ref = item.strip()
+                elif isinstance(item, dict):
+                    for key in ("ref", "openid", "openId", "wxid", "wx_id", "id", "account"):
+                        if item.get(key) not in (None, ""):
+                            ref = str(item[key]).strip()
+                            break
+                if ref and ref not in seen:
+                    seen.add(ref)
+                    refs.append(ref)
+            if refs:
+                print("ℹ️ %s 自动发现 %d 个账号" % (server, len(refs)))
+                for ref in refs:
+                    accounts.append({"id": server + '@' + ref, "ref": ref, "note": ""})
+            else:
+                print("⚠️ %s /accounts 未解析到账号（请确认 YYB 服务在线且已授权）" % server)
+        except Exception as exc:
+            print("⚠️ 读取 %s/accounts 失败（%s），请确认 YYB 服务在线且已授权" % (server, type(exc).__name__))
     return accounts
 
 # ============================================================
